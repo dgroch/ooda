@@ -1,0 +1,25 @@
+{
+  "name": "logic-kernel",
+  "version": "0.1.0",
+  "description": "A runtime-agnostic cognitive architecture for AI agents. OODA-based logic kernel with structural dependency resolution, pattern matching, escalation engine, and three-tier memory.",
+  "type": "module",
+  "main": "kernel.js",
+  "scripts": {
+    "start": "node server.js",
+    "demo": "node example.js"
+  },
+  "keywords": [
+    "ai-agent",
+    "cognitive-architecture",
+    "ooda",
+    "agent-kernel"
+  ],
+  "author": "Dan Groch",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^5.1.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
