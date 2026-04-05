@@ -1198,6 +1198,9 @@ Decide HOW to execute. Respond with JSON:
     if (findings.newPatterns) for (const p of findings.newPatterns) await this.memory.upsertPattern(p);
     if (findings.newSkill) await this.memory.addSkill(findings.newSkill);
 
+    if (!findings.newSkill) {
+      return { success: false, error: 'no skill acquired', type: 'research', findings };
+    }
     return { success: true, type: 'research', findings };
   }
 
