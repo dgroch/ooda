@@ -17,7 +17,7 @@
   "author": "Dan Groch",
   "license": "MIT",
   "dependencies": {
-    "express": "^5.1.0"
+    "express": "^5.2.1"
   },
   "engines": {
     "node": ">=22.0.0"
