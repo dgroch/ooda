@@ -990,9 +990,25 @@ Do NOT decide on actions — that happens in DECIDE.`,
       }),
     );
 
-    activation.working.orientation = orientation;
-    this._emit(activation, 'orient', observation, orientation, Date.now() - t0);
-    return { ...observation, orientation };
+    const activeGoals = observation.activeGoals ?? [];
+    const triggerGoalId = observation.trigger?.payload?.goalId ?? null;
+    const highestPriorityGoal = activeGoals.length > 0
+      ? [...activeGoals].sort((a, b) => (b.priority ?? 1) - (a.priority ?? 1))[0]
+      : null;
+    const selectedGoal = activeGoals.find((g) => g.id === orientation?.goalId)
+      ?? activeGoals.find((g) => g.id === triggerGoalId)
+      ?? highestPriorityGoal
+      ?? null;
+
+    const normalizedOrientation = {
+      ...orientation,
+      goalId: selectedGoal?.id ?? null,
+      structurallySelectedGoal: !orientation?.goalId && !!selectedGoal,
+    };
+
+    activation.working.orientation = normalizedOrientation;
+    this._emit(activation, 'orient', observation, normalizedOrientation, Date.now() - t0);
+    return { ...observation, orientation: normalizedOrientation };
   }
 
   // ── Phase 2.5: REFLECT (Self-Interrogation) ──
