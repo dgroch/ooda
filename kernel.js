@@ -415,15 +415,13 @@ class MemoryManager {
   clearWorking() { this.working = {}; }
 
   async recordEpisode(episode) {
-    const episodes = (await this.store.get('episodes')) ?? [];
-    episodes.push({ ...episode, timestamp: new Date().toISOString() });
-    if (episodes.length > 200) episodes.splice(0, episodes.length - 200);
-    await this.store.set('episodes', episodes);
+    const id = episode.id ?? `ep_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const { id: _id, ...rest } = episode;
+    await this.store.appendEpisode({ id, ...rest, timestamp: new Date().toISOString() });
   }
 
   async getRecentEpisodes(n = 20) {
-    const episodes = (await this.store.get('episodes')) ?? [];
-    return episodes.slice(-n);
+    return this.store.getRecentEpisodes(n);
   }
 
   async queryEpisodes(filter) {
@@ -431,41 +429,53 @@ class MemoryManager {
     return episodes.filter(filter);
   }
 
-  async getSkills()     { return (await this.store.get('skills')) ?? []; }
-  async getPatterns()   { return (await this.store.get('patterns')) ?? []; }
-  async getKnowledge()  { return (await this.store.get('knowledge')) ?? []; }
+  async getSkills() {
+    const rows = await this.store.listSkills();
+    return rows.map((r) => JSON.parse(r.data));
+  }
+
+  async getPatterns() {
+    const rows = await this.store.listPatterns();
+    return rows.map((r) => ({
+      id: r.id,
+      condition: r.condition,
+      action: r.action,
+      priority: r.priority,
+      lastMatched: r.last_matched,
+    }));
+  }
+
+  async getKnowledge() {
+    const rows = await this.store.listKnowledge();
+    return rows.map((r) => ({
+      id: r.id,
+      fact: r.fact,
+      confidence: r.confidence,
+      learnedAt: r.learned_at,
+    }));
+  }
+
   async getTeamRoster() { return (await this.store.get('team')) ?? []; }
-  async getGoals()      { return (await this.store.get('goals')) ?? []; }
+
+  async getGoals() {
+    const rows = await this.store.listGoals();
+    return rows.map((r) => JSON.parse(r.data ?? 'null')).filter(Boolean);
+  }
 
   async addSkill(skill) {
-    const items = await this.getSkills();
-    items.push(skill);
-    await this.store.set('skills', items);
+    await this.store.upsertSkill(skill);
   }
 
   async upsertPattern(pattern) {
-    const items = await this.getPatterns();
-    const idx = items.findIndex((p) => p.id === pattern.id);
-    if (idx >= 0) items[idx] = pattern; else items.push(pattern);
-    await this.store.set('patterns', items);
+    await this.store.upsertPattern(pattern);
   }
 
   async addKnowledge(entry) {
-    const items = await this.getKnowledge();
-    items.push({ ...entry, learnedAt: new Date().toISOString() });
-    // Evict lowest-confidence entries when we exceed 1000
-    if (items.length > 1000) {
-      items.sort((a, b) => (a.confidence ?? 0.5) - (b.confidence ?? 0.5));
-      items.splice(0, items.length - 1000);
-    }
-    await this.store.set('knowledge', items);
+    await this.store.upsertKnowledge(entry);
   }
 
   async upsertGoal(goal) {
-    const items = await this.getGoals();
-    const idx = items.findIndex((g) => g.id === goal.id);
-    if (idx >= 0) items[idx] = goal; else items.push(goal);
-    await this.store.set('goals', items);
+    await this.store.upsertGoal(goal);
   }
 
   async getPendingMessages(toAgent) {
@@ -1281,6 +1291,85 @@ class InMemoryStore {
   async set(key, value) { this.data.set(key, JSON.parse(JSON.stringify(value))); }
   async delete(key) { this.data.delete(key); }
   async list(prefix) { return [...this.data.keys()].filter((k) => k.startsWith(prefix ?? '')); }
+
+  // ── Episodes (atomic push + trim) ────────────────────
+  async appendEpisode(episode) {
+    const episodes = (await this.get('episodes')) ?? [];
+    episodes.push(episode);
+    if (episodes.length > 200) episodes.splice(0, episodes.length - 200);
+    await this.set('episodes', episodes);
+  }
+
+  async getRecentEpisodes(n) {
+    const episodes = (await this.get('episodes')) ?? [];
+    return episodes.slice(-n);
+  }
+
+  // ── Patterns (atomic upsert) ──────────────────────────
+  async upsertPattern(pattern) {
+    const items = (await this.get('patterns')) ?? [];
+    const idx = items.findIndex((p) => p.id === pattern.id);
+    if (idx >= 0) items[idx] = pattern; else items.push(pattern);
+    await this.set('patterns', items);
+  }
+
+  async listPatterns() {
+    const items = (await this.get('patterns')) ?? [];
+    return items.map((p) => ({
+      id: p.id,
+      condition: p.condition,
+      action: p.action,
+      priority: p.priority,
+      last_matched: p.lastMatched,
+    }));
+  }
+
+  // ── Skills (atomic upsert) ──────────────────────────
+  async upsertSkill(skill) {
+    const items = (await this.get('skills')) ?? [];
+    const idx = items.findIndex((s) => s.id === skill.id);
+    if (idx >= 0) items[idx] = skill; else items.push(skill);
+    await this.set('skills', items);
+  }
+
+  async listSkills() {
+    const items = (await this.get('skills')) ?? [];
+    return items.map((s) => ({ id: s.id, data: JSON.stringify(s) }));
+  }
+
+  // ── Goals (atomic upsert) ──────────────────────────
+  async upsertGoal(goal) {
+    const items = (await this.get('goals')) ?? [];
+    const idx = items.findIndex((g) => g.id === goal.id);
+    if (idx >= 0) items[idx] = goal; else items.push(goal);
+    await this.set('goals', items);
+  }
+
+  async listGoals() {
+    const items = (await this.get('goals')) ?? [];
+    return items.map((g) => ({ id: g.id, data: JSON.stringify(g) }));
+  }
+
+  // ── Knowledge (atomic push + eviction) ─────────────
+  async upsertKnowledge(entry) {
+    const items = (await this.get('knowledge')) ?? [];
+    items.push({ ...entry, learnedAt: new Date().toISOString() });
+    if (items.length > 1000) {
+      items.sort((a, b) => (a.confidence ?? 0.5) - (b.confidence ?? 0.5));
+      items.splice(0, items.length - 1000);
+    }
+    await this.set('knowledge', items);
+  }
+
+  async listKnowledge() {
+    const items = (await this.get('knowledge')) ?? [];
+    return items.map((k) => ({
+      id: k.id,
+      fact: k.fact,
+      confidence: k.confidence,
+      learned_at: k.learnedAt,
+    }));
+  }
 }
 
 // ─────────────────────────────────────────────
