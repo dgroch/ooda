@@ -25,8 +25,7 @@
 
 import express from 'express';
 import { createHmac, timingSafeEqual } from 'crypto';
-import { AgentKernel, ActivationHarness, MemoryManager, SkillRegistry, ToolRegistry } from './kernel.js';
-import { SqliteStore } from './store-sqlite.js';
+import { AgentKernel, ActivationHarness, MemoryManager, SkillRegistry, ToolRegistry, InMemoryStore } from './kernel.js';
 
 // ─────────────────────────────────────────────
 // HTTPS Requirement (enforce in production)
@@ -56,7 +55,8 @@ const config = {
 // Persistence
 // ─────────────────────────────────────────────
 
-const store = new SqliteStore(config.dbPath);
+// Use InMemoryStore on Node <22 (node:sqlite requires Node 22+)
+const store = new InMemoryStore();
 const memory = new MemoryManager(store);
 
 // ─────────────────────────────────────────────
@@ -683,12 +683,12 @@ Waiting for events...
 process.on('SIGINT', () => {
   console.log('\n[shutdown] Stopping...');
   harness.stop();
-  store.close();
+  if (store?.close) store.close();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
   harness.stop();
-  store.close();
+  if (store?.close) store.close();
   process.exit(0);
 });
