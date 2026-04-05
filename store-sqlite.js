@@ -53,6 +53,8 @@ class SqliteStore {
         phase TEXT,
         action_type TEXT,
         outcome TEXT,
+        metadata TEXT DEFAULT '{}',
+        data TEXT,
         timestamp TEXT DEFAULT (datetime('now'))
       )
     `);
@@ -60,9 +62,10 @@ class SqliteStore {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS patterns (
         id TEXT PRIMARY KEY,
-        condition TEXT,
+        conditions TEXT,
         action TEXT,
         priority INTEGER,
+        data TEXT,
         last_matched TEXT
       )
     `);
@@ -85,11 +88,13 @@ class SqliteStore {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS knowledge (
         id TEXT PRIMARY KEY,
-        fact TEXT,
+        data TEXT,
         confidence REAL,
         learned_at TEXT DEFAULT (datetime('now'))
       )
     `);
+
+    this._ensureSchemaCompatibility();
 
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_episodes_timestamp ON episodes(timestamp)`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_episodes_activation ON episodes(activation_id)`);
@@ -111,13 +116,13 @@ class SqliteStore {
     this._msgListByGoal = this.db.prepare('SELECT * FROM messages WHERE goal_id = ? ORDER BY created_at ASC');
 
     // Episode statements
-    this._epInsert = this.db.prepare('INSERT INTO episodes (id, activation_id, cycle, phase, action_type, outcome, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    this._epInsert = this.db.prepare('INSERT INTO episodes (id, activation_id, cycle, phase, action_type, outcome, metadata, data, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
     this._epGetRecent = this.db.prepare('SELECT * FROM episodes ORDER BY timestamp DESC LIMIT ?');
     this._epCount = this.db.prepare('SELECT COUNT(*) as count FROM episodes');
     this._epDeleteOldest = this.db.prepare('DELETE FROM episodes WHERE id IN (SELECT id FROM episodes ORDER BY timestamp ASC LIMIT ?)');
 
     // Pattern statements
-    this._patternUpsert = this.db.prepare('INSERT OR REPLACE INTO patterns (id, condition, action, priority, last_matched) VALUES (?, ?, ?, ?, ?)');
+    this._patternUpsert = this.db.prepare('INSERT OR REPLACE INTO patterns (id, conditions, action, priority, data, last_matched) VALUES (?, ?, ?, ?, ?, ?)');
     this._patternGetAll = this.db.prepare('SELECT * FROM patterns');
 
     // Skill statements
@@ -129,8 +134,56 @@ class SqliteStore {
     this._goalGetAll = this.db.prepare('SELECT * FROM goals');
 
     // Knowledge statements
-    this._knowledgeUpsert = this.db.prepare('INSERT OR REPLACE INTO knowledge (id, fact, confidence, learned_at) VALUES (?, ?, ?, datetime("now"))');
+    this._knowledgeUpsert = this.db.prepare('INSERT OR REPLACE INTO knowledge (id, data, confidence, learned_at) VALUES (?, ?, ?, datetime("now"))');
     this._knowledgeGetAll = this.db.prepare('SELECT * FROM knowledge');
+  }
+
+  _ensureSchemaCompatibility() {
+    const addColumnIfMissing = (table, column, typeExpr) => {
+      const cols = this.db.prepare(`PRAGMA table_info(${table})`).all();
+      if (!cols.some((c) => c.name === column)) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${typeExpr}`);
+      }
+    };
+
+    addColumnIfMissing('episodes', 'metadata', "TEXT DEFAULT '{}'");
+    addColumnIfMissing('episodes', 'data', 'TEXT');
+    addColumnIfMissing('patterns', 'conditions', 'TEXT');
+    addColumnIfMissing('patterns', 'data', 'TEXT');
+    addColumnIfMissing('knowledge', 'data', 'TEXT');
+  }
+
+  _mapMessageRow(row) {
+    if (!row) return null;
+    return {
+      id: row.id,
+      from: row.from_agent,
+      to: row.to_agent,
+      content: row.content,
+      goalId: row.goal_id,
+      stepId: row.step_id,
+      status: row.status,
+      metadata: JSON.parse(row.metadata ?? '{}'),
+      createdAt: row.created_at,
+      acknowledgedAt: row.acknowledged_at,
+    };
+  }
+
+  _mapEpisodeRow(row) {
+    if (!row) return null;
+    const fromData = row.data ? JSON.parse(row.data) : {};
+    const metadata = row.metadata ? JSON.parse(row.metadata) : {};
+    return {
+      ...fromData,
+      id: row.id,
+      activationId: row.activation_id,
+      cycle: row.cycle,
+      phase: row.phase,
+      actionType: row.action_type,
+      outcome: row.outcome ? JSON.parse(row.outcome) : null,
+      metadata,
+      timestamp: row.timestamp,
+    };
   }
 
   async get(key) {
@@ -167,36 +220,41 @@ class SqliteStore {
 
   async getMessage(id) {
     const row = this._msgGet.get(id);
-    return row ? { ...row, metadata: JSON.parse(row.metadata) } : null;
+    return this._mapMessageRow(row);
   }
 
   async getPendingMessages(toAgent) {
     const rows = this._msgListPending.all(toAgent, 'pending');
-    return rows.map((r) => ({ ...r, metadata: JSON.parse(r.metadata) }));
+    return rows.map((r) => this._mapMessageRow(r));
   }
 
   async acknowledgeMessage(id) {
     const row = this._msgGet.get(id);
     if (!row) return null;
     this._msgAck.run(id);
-    return { ...row, status: 'acknowledged' };
+    return this._mapMessageRow({ ...row, status: 'acknowledged' });
   }
 
   async getMessagesByGoal(goalId) {
     const rows = this._msgListByGoal.all(goalId);
-    return rows.map((r) => ({ ...r, metadata: JSON.parse(r.metadata) }));
+    return rows.map((r) => this._mapMessageRow(r));
   }
 
   // ── Episodes ──────────────────────────────────────────
 
   async appendEpisode(episode) {
+    const metadata = episode.metadata ?? {};
+    const outcome = episode.outcome ?? null;
+    const fullEpisode = { ...episode };
     this._epInsert.run(
       episode.id,
-      episode.activation_id ?? null,
+      episode.activationId ?? episode.activation_id ?? null,
       episode.cycle ?? null,
       episode.phase ?? null,
-      episode.action_type ?? null,
-      episode.outcome ?? null,
+      episode.actionType ?? episode.action_type ?? null,
+      JSON.stringify(outcome),
+      JSON.stringify(metadata),
+      JSON.stringify(fullEpisode),
       episode.timestamp ?? new Date().toISOString(),
     );
     // Trim to 200 most recent
@@ -207,29 +265,43 @@ class SqliteStore {
   }
 
   async getRecentEpisodes(n) {
-    return this._epGetRecent.all(n);
+    return this._epGetRecent.all(n).map((r) => this._mapEpisodeRow(r));
   }
 
   async queryEpisodes(filter) {
     // Fetch all and filter in-memory (episodes table is capped at 200 rows)
-    const rows = this._epGetRecent.all(200);
+    const rows = this._epGetRecent.all(200).map((r) => this._mapEpisodeRow(r));
     return rows.filter(filter);
   }
 
   // ── Patterns ──────────────────────────────────────────
 
   async upsertPattern(pattern) {
+    const conditions = Array.isArray(pattern.conditions)
+      ? pattern.conditions
+      : (pattern.condition ? [pattern.condition] : []);
     this._patternUpsert.run(
       pattern.id,
-      pattern.condition ?? null,
+      JSON.stringify(conditions),
       pattern.action ?? null,
       pattern.priority ?? null,
+      JSON.stringify(pattern),
       pattern.lastMatched ?? null,
     );
   }
 
   async listPatterns() {
-    return this._patternGetAll.all();
+    return this._patternGetAll.all().map((r) => {
+      if (r.data) return JSON.parse(r.data);
+      const conditions = r.conditions ? JSON.parse(r.conditions) : [];
+      return {
+        id: r.id,
+        conditions,
+        action: r.action,
+        priority: r.priority,
+        lastMatched: r.last_matched,
+      };
+    });
   }
 
   // ── Skills ──────────────────────────────────────────
@@ -255,7 +327,9 @@ class SqliteStore {
   // ── Knowledge ──────────────────────────────────────────
 
   async upsertKnowledge(entry) {
-    this._knowledgeUpsert.run(entry.id, entry.fact, entry.confidence ?? 0.5);
+    const id = entry.id ?? `kn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const confidence = entry.confidence ?? 0.5;
+    this._knowledgeUpsert.run(id, JSON.stringify(entry), confidence);
     // Evict lowest confidence when > 1000
     const rows = this._knowledgeGetAll.all();
     if (rows.length > 1000) {
@@ -268,7 +342,10 @@ class SqliteStore {
   }
 
   async listKnowledge() {
-    return this._knowledgeGetAll.all();
+    return this._knowledgeGetAll.all().map((r) => {
+      if (r.data) return JSON.parse(r.data);
+      return { id: r.id, confidence: r.confidence };
+    });
   }
 
   close() {
