@@ -450,11 +450,23 @@ class MemoryManager {
   constructor(store) {
     this.store = store;
     this.working = {};
+    this._listeners = new Map();
   }
 
   setWorking(key, value) { this.working[key] = value; }
   getWorking(key) { return this.working[key] ?? null; }
   clearWorking() { this.working = {}; }
+
+  on(eventType, handler) {
+    if (!this._listeners.has(eventType)) this._listeners.set(eventType, []);
+    this._listeners.get(eventType).push(handler);
+    return this;
+  }
+
+  emit(eventType, ...args) {
+    const handlers = this._listeners.get(eventType) ?? [];
+    for (const h of handlers) h(...args);
+  }
 
   async recordEpisode(episode) {
     const id = episode.id ?? `ep_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -497,6 +509,11 @@ class MemoryManager {
   }
 
   async getTeamRoster() { return (await this.store.get('team')) ?? []; }
+
+  /** Emit a named event into the episode log (for auditing and pattern learning). */
+  async emit(type, event, data) {
+    await this.recordEpisode({ id: `evt_${Date.now()}_${Math.random().toString(36).slice(2)}`, type, event, data });
+  }
 
   async getGoals() {
     const rows = await this.store.listGoals();
@@ -713,6 +730,8 @@ class AgentKernel {
     this.identity = config.identity ?? { name: 'Agent', role: 'worker' };
     this.onPhase = config.onPhase ?? (() => {});
     this.maxCycles = config.maxCycles ?? 20;
+    this.maxContextTokens = config.maxContextTokens ?? 120000;
+    this.maxNoProgressCycles = config.maxNoProgressCycles ?? 3;
 
     this.escalation = new EscalationEngine({
       confidenceThreshold: config.confidenceThreshold ?? 0.4,
@@ -728,6 +747,7 @@ class AgentKernel {
     this._cycleCount = 0;
     this._activationId = null;
     this._stepCycleCounts = new Map();
+    this._noProgressCycles = 0;
 
     // Metrics
     this._metrics = {
@@ -775,6 +795,7 @@ class AgentKernel {
     this._activationId = `act_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     this._cycleCount = 0;
     this._stepCycleCounts.clear();
+    this._noProgressCycles = 0;
     this.memory.clearWorking();
     this.memory.setWorking('trigger', trigger);
     this.memory.setWorking('activationId', this._activationId);
@@ -834,13 +855,24 @@ class AgentKernel {
     // Structural pattern matching — kernel logic, not LLM
     const { matched: matchedPatterns, predictions } = PatternMatcher.match(patterns, flatState);
 
-    const observation = {
+    let observation = {
       trigger, activeGoals, recentEpisodes: episodes,
       matchedPatterns, predictions,
       availableSkills: this.skills.list(),
       availableTools: this.tools.list(),
       storedKnowledge: knowledge, team, flatState,
     };
+
+    // ── Token Budget Enforcement (Issue #14) ──
+    const flat = JSON.stringify(observation);
+    const tokens = this._countPromptTokens(flat);
+    if (tokens > this.maxContextTokens) {
+      const originalTokens = tokens;
+      observation = this._applyContextBudget(observation, { over: true });
+      const trimmed = JSON.stringify(observation);
+      const finalTokens = this._countPromptTokens(trimmed);
+      this.memory.emit('warning', 'context_truncated', { originalTokens, finalTokens });
+    }
 
     this._emit('observe', trigger, observation, Date.now() - t0);
     return observation;
@@ -1099,6 +1131,25 @@ Decide HOW to execute. Respond with JSON:
       }),
     );
 
+    // ── NOVELTY PENALTY — reduce confidence when LLM operates in uncharted territory ──
+    const matchedPatterns = reflected.matchedPatterns ?? [];
+    const hasMatch = matchedPatterns.length > 0;
+    const baseConfidence = llmDecision.confidence ?? 0.5;
+    const adjustedConfidence = hasMatch ? baseConfidence : Math.max(0.1, baseConfidence - 0.25);
+
+    if (!hasMatch && baseConfidence > 0.8) {
+      // High confidence with no pattern support = hallucination risk
+      this.memory.emit('warning', 'high_confidence_novel_situation', {
+        baseConfidence, adjustedConfidence, goalId: reflected.resolvedGoal?.id,
+      });
+    } else if (hasMatch && baseConfidence > 0.8) {
+      // Positive reinforcement — high confidence backed by pattern
+      this.memory.emit('info', 'pattern_confirmed_high_confidence', {
+        baseConfidence, matchedPatternIds: matchedPatterns.map(p => p.id), goalId: reflected.resolvedGoal?.id,
+      });
+    }
+    llmDecision.confidence = adjustedConfidence;
+
     // ── ACTION VALIDATION — kernel gate before execution ──
     const route = llmDecision.route ?? 'self';
     const action = llmDecision.action ?? {};
@@ -1322,6 +1373,89 @@ Decide HOW to execute. Respond with JSON:
     return { success: true, type: 'research', findings };
   }
 
+  // ── Token Budget ──
+
+  _countPromptTokens(text) {
+    return Math.ceil(text.length / 4);
+  }
+
+  async _summariseEpisodes(episodes, maxTokens) {
+    // Stub: if LLM is unavailable, just return the last 3 episodes
+    if (!this.reason) return episodes.slice(-3);
+    try {
+      const summary = await this.reason(
+        this._buildPrompt('summarise', {
+          episodes,
+          maxTokens,
+          instructions: `Compress these episodes into fewer entries totalling approximately ${maxTokens} tokens.
+Return JSON: { "summarised": [{ "id": "...", "text": "...", "tokens": N }] }`,
+        }),
+      );
+      return summary.summarised ?? episodes.slice(-3);
+    } catch {
+      return episodes.slice(-3);
+    }
+  }
+
+  _applyContextBudget(observation, budget) {
+    let { recentEpisodes, storedKnowledge, matchedPatterns } = observation;
+    let truncated = false;
+
+    // Cut 1: Reduce episodes from 10 to last 5
+    if (budget.over) {
+      if (recentEpisodes.length > 5) {
+        recentEpisodes = recentEpisodes.slice(-5);
+        truncated = true;
+      }
+    }
+
+    // Cut 2: Drop low-confidence knowledge
+    if (budget.over && storedKnowledge.length > 0) {
+      const filtered = storedKnowledge.filter((k) => (k.confidence ?? 0.5) >= 0.5);
+      if (filtered.length < storedKnowledge.length) {
+        storedKnowledge = filtered;
+        truncated = true;
+      }
+    }
+
+    // Cut 3: Limit patterns to top 5 by priority
+    if (budget.over && matchedPatterns.length > 5) {
+      matchedPatterns = [...matchedPatterns]
+        .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))
+        .slice(0, 5);
+      truncated = true;
+    }
+
+    return { ...observation, recentEpisodes, storedKnowledge, matchedPatterns, __TRUNCATED__: truncated };
+  }
+
+  // ── Goal Planning ──
+
+  async _plan(goal) {
+    if (goal.steps && goal.steps.length > 0) return null;
+
+    const planResult = await this.reason(
+      this._buildPrompt('plan', {
+        identity: this.identity,
+        goal: { id: goal.id, description: goal.description },
+        instructions: `Decompose this goal into ordered steps. Return JSON:
+{ "steps": [{ "id": "step_1", "description": "...", "dependencies": [], "status": "pending" }] }`,
+      }),
+    );
+
+    const steps = planResult.steps ?? [];
+    if (!steps.length) return null;
+
+    const validation = DependencyResolver.validate(steps);
+    if (!validation.valid) {
+      throw new Error(`Plan validation failed: ${validation.errors.join('; ')}`);
+    }
+
+    goal.steps = steps;
+    await this.memory.upsertGoal(goal);
+    return steps;
+  }
+
   // ── Helpers ──
 
   _buildFlatState(trigger, activeGoals, episodes) {
@@ -1339,11 +1473,22 @@ Decide HOW to execute. Respond with JSON:
       }
     }
 
+    // Include all active goals' metadata for LLM reasoning across goals
     if (activeGoals.length > 0) {
-      const goal = activeGoals[0];
+      const sortedGoals = [...activeGoals].sort((a, b) => (b.priority ?? 1) - (a.priority ?? 1));
+      state['goals.all'] = JSON.stringify(sortedGoals.map(g => ({
+        id: g.id,
+        description: g.description,
+        priority: g.priority ?? 1,
+        status: g.status,
+        progress: g.steps ? DependencyResolver.progress(g.steps).progress : 0,
+      })));
+      // Primary goal (highest priority)
+      const goal = sortedGoals[0];
       state['goal.id'] = goal.id;
       state['goal.status'] = goal.status;
       state['goal.assignedBy'] = goal.assignedBy ?? '';
+      state['goal.priority'] = String(goal.priority ?? 1);
       if (goal.steps) {
         const prog = DependencyResolver.progress(goal.steps);
         state['goal.progress'] = String(prog.progress.toFixed(2));

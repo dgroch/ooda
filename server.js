@@ -382,7 +382,7 @@ app.post('/webhook/:eventType', auth, (req, res) => {
 // ── POST /goals ──
 // Assign a goal to the agent.
 app.post('/goals', auth, async (req, res) => {
-  const { id, description, steps, criteria, assignedBy } = req.body;
+  const { id, description, steps, criteria, assignedBy, priority } = req.body;
 
   if (!id || !description) {
     return res.status(400).json({ error: 'id and description required' });
@@ -391,6 +391,7 @@ app.post('/goals', auth, async (req, res) => {
   const goal = {
     id,
     description,
+    priority: priority ?? 1,
     steps: (steps ?? []).map((s, i) => ({
       id: s.id ?? `step_${i + 1}`,
       description: s.description,
@@ -447,9 +448,44 @@ app.get('/status', async (req, res) => {
   });
 });
 
+// ── Health check helpers ──
+async function checkSqlite() {
+  try {
+    store.db.exec('SELECT 1');
+    return true;
+  } catch { return false; }
+}
+async function checkLlmHealth() {
+  try {
+    const res = await fetch(llmConfig.baseUrl + '/models', {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${llmConfig.apiKey}` },
+      signal: AbortSignal.timeout(3000),
+    });
+    return res.ok;
+  } catch { return false; }
+}
+async function checkWebhookReachability() {
+  if (!config.outboundWebhookUrl) return null;
+  try {
+    const res = await fetch(config.outboundWebhookUrl, {
+      method: 'HEAD',
+      signal: AbortSignal.timeout(3000),
+    });
+    return res.ok;
+  } catch { return false; }
+}
+
 // ── GET /health ──
-app.get('/health', (req, res) => {
-  res.json({ ok: true, agent: config.agentName, uptime: process.uptime() });
+app.get('/health', async (req, res) => {
+  const [sqlite, llm, webhook] = await Promise.all([
+    checkSqlite(),
+    checkLlmHealth(),
+    checkWebhookReachability(),
+  ]);
+  const checks = { sqlite, llm, webhook };
+  const healthy = [sqlite, llm].every(v => v === true);
+  res.status(healthy ? 200 : 503).json({ ok: healthy, checks, timestamp: new Date().toISOString() });
 });
 
 // ── GET /metrics ──
