@@ -577,11 +577,45 @@ class AgentKernel {
     this._cycleCount = 0;
     this._activationId = null;
     this._stepCycleCounts = new Map();
+
+    // Metrics
+    this._metrics = {
+      totalActivations: 0,
+      totalCycles: 0,
+      totalEscalations: 0,
+      totalGoalCompletes: 0,
+      _cycleDurations: [], // rolling window for avg
+    };
+  }
+
+  getMetrics() {
+    const durations = this._metrics._cycleDurations;
+    const avgCycleDuration = durations.length
+      ? durations.reduce((a, b) => a + b, 0) / durations.length
+      : 0;
+    return {
+      totalActivations: this._metrics.totalActivations,
+      totalCycles: this._metrics.totalCycles,
+      avgCycleDurationMs: Math.round(avgCycleDuration),
+      totalEscalations: this._metrics.totalEscalations,
+      totalGoalCompletes: this._metrics.totalGoalCompletes,
+    };
+  }
+
+  _recordMetrics(result, totalDurationMs) {
+    this._metrics.totalActivations++;
+    this._metrics.totalCycles += result.cycles ?? 0;
+    if (result.status === 'complete') this._metrics.totalGoalCompletes++;
+    this._metrics._cycleDurations.push(totalDurationMs);
+    if (this._metrics._cycleDurations.length > 100) {
+      this._metrics._cycleDurations.shift(); // keep rolling window at 100
+    }
   }
 
   // ── Public API ──
 
   async activate(trigger) {
+    const t0 = Date.now();
     this._activationId = `act_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     this._cycleCount = 0;
     this._stepCycleCounts.clear();
@@ -589,7 +623,9 @@ class AgentKernel {
     this.memory.setWorking('trigger', trigger);
     this.memory.setWorking('activationId', this._activationId);
     this.memory.setWorking('researchFailed', false); // reset per-activation
-    return this._cycle(trigger);
+    const result = await this._cycle(trigger);
+    this._recordMetrics(result, Date.now() - t0);
+    return result;
   }
 
   // ── OODA + Reflect Cycle ──
@@ -810,6 +846,7 @@ Respond with JSON:
     });
 
     if (escalationVerdict.mustEscalate) {
+      this._metrics.totalEscalations++;
       const msgId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       const pendingMessage = {
         id: msgId,
@@ -1166,7 +1203,12 @@ Decide HOW to execute. Respond with JSON:
   }
 
   _buildPrompt(phase, context) {
-    return JSON.stringify({ phase, agentIdentity: context.identity, ...context });
+    return JSON.stringify({
+      phase,
+      activationId: this._activationId,
+      agentIdentity: context.identity,
+      ...context,
+    });
   }
 
   _emit(phase, input, output, durationMs) {

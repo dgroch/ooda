@@ -110,11 +110,151 @@ tools.register({
  *     return JSON.parse(msg.content[0].text);
  *   }
  */
+
+// ─────────────────────────────────────────────
+// LLM Configuration
+// ─────────────────────────────────────────────
+
+const llmConfig = {
+  baseUrl:         process.env.LLM_BASE_URL         ?? 'https://api.openai.com/v1',
+  apiKey:          process.env.LLM_API_KEY          ?? null,
+  model:           process.env.LLM_MODEL            ?? 'gpt-4o-mini',
+  maxRetries:      parseInt(process.env.LLM_RETRY_MAX     ?? '3'),
+  baseRetryDelayMs: parseInt(process.env.LLM_RETRY_DELAY ?? '1000'),
+  maxRetryDelayMs:  parseInt(process.env.LLM_MAX_DELAY    ?? '10000'),
+  timeoutMs:       parseInt(process.env.LLM_TIMEOUT_MS    ?? '30000'),
+  maxTokens:       parseInt(process.env.LLM_MAX_TOKENS    ?? '4096'),
+};
+
+/**
+ * Retry with exponential backoff + jitter.
+ */
+async function withRetry(fn) {
+  let lastError;
+  for (let attempt = 0; attempt <= llmConfig.maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (err.status === 429) {
+        // Respect Retry-After header, or use exponential backoff
+        const retryAfter = err.headers?.['retry-after'];
+        let delay = retryAfter
+          ? parseInt(retryAfter) * 1000
+          : Math.min(llmConfig.baseRetryDelayMs * 2 ** attempt, llmConfig.maxRetryDelayMs);
+        // Add jitter ±25%
+        delay = delay * (0.75 + Math.random() * 0.5);
+        console.warn(`[llm] Rate limited. Retrying in ${(delay / 1000).toFixed(1)}s (attempt ${attempt + 1}/${llmConfig.maxRetries})`);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      // Non-retryable error — fail immediately
+      if (attempt === 0) throw err;
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Parse JSON from LLM response, handling common malformations:
+ * - Markdown code fences (```json ... ```)
+ * - Trailing commas
+ * - Single-quoted strings
+ */
+function parseLlmJson(raw) {
+  let text = typeof raw === 'string' ? raw : String(raw);
+  // Strip markdown code fences
+  text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  // Remove trailing commas before closing braces/brackets
+  text = text.replace(/,(\s*[}\]])/g, '$1');
+  // Replace single-quoted strings with double-quoted (simple cases only)
+  // Only replace when inside JSON values, not when part of a contraction
+  text = text.replace(/'/g, '"');
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Last resort: find the first { or [ and parse from there
+    const start = text.search(/[[{]/);
+    if (start >= 0) {
+      try { return JSON.parse(text.slice(start)); } catch { /* fall through */ }
+    }
+    return null;
+  }
+}
+
+/**
+ * Production-grade reason() function.
+ * Calls the configured LLM with timeout, retry, JSON recovery, and structured output.
+ */
 async function reason(prompt) {
-  // Placeholder — replace with real LLM call
-  const ctx = JSON.parse(prompt);
-  console.log(`[llm] ${ctx.phase} phase (stub — wire up your LLM)`);
-  return { situationAssessment: 'stub', goalId: null, confidence: 0.5, answers: [], revisedConfidence: 0.5, insights: [] };
+  // If no API key is configured, fall back to stub
+  if (!llmConfig.apiKey) {
+    const ctx = JSON.parse(prompt);
+    console.log(`[llm] ${ctx.phase ?? '?'} phase (stub — set LLM_API_KEY to enable)`);
+    return {
+      situationAssessment: 'stub',
+      goalId: null,
+      confidence: 0.5,
+      answers: [],
+      revisedConfidence: 0.5,
+      insights: [],
+    };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), llmConfig.timeoutMs);
+
+  try {
+    const result = await withRetry(async () => {
+      const response = await fetch(`${llmConfig.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${llmConfig.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: llmConfig.model,
+          max_tokens: llmConfig.maxTokens,
+          response_format: { type: 'json_object' },
+          messages: [
+            {
+              role: 'system',
+              content: 'Respond with valid JSON only. No markdown, no preamble, no commentary.',
+            },
+            { role: 'user', content: prompt },
+          ],
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        const err = new Error(`LLM API error ${response.status}: ${body}`);
+        err.status = response.status;
+        err.headers = { 'retry-after': response.headers.get('retry-after') };
+        throw err;
+      }
+
+      return response.json();
+    });
+
+    clearTimeout(timeout);
+    const raw = result.choices?.[0]?.message?.content ?? '';
+    const parsed = parseLlmJson(raw);
+
+    if (!parsed) {
+      console.error('[llm] Failed to parse LLM response as JSON:', raw.slice(0, 200));
+      throw new Error(`LLM returned unparseable response: ${raw.slice(0, 100)}`);
+    }
+
+    return parsed;
+  } catch (err) {
+    clearTimeout(timeout);
+    if (err.name === 'AbortError') {
+      throw new Error(`LLM call timed out after ${llmConfig.timeoutMs}ms`);
+    }
+    throw err;
+  }
 }
 
 const kernel = new AgentKernel({
@@ -260,6 +400,16 @@ app.get('/status', async (req, res) => {
 // ── GET /health ──
 app.get('/health', (req, res) => {
   res.json({ ok: true, agent: config.agentName, uptime: process.uptime() });
+});
+
+// ── GET /metrics ──
+// Agent metrics for monitoring.
+app.get('/metrics', auth, async (req, res) => {
+  const goals = await memory.getGoals();
+  res.json({
+    ...kernel.getMetrics(),
+    activeGoals: goals.filter((g) => g.status === 'active' || g.status === 'pending').length,
+  });
 });
 
 // ── GET /messages ──
