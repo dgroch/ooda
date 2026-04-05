@@ -14,6 +14,48 @@
  */
 
 // ─────────────────────────────────────────────
+// 0. CIRCUIT BREAKER
+//    Tracks consecutive LLM failures; halts reasoning when open.
+// ─────────────────────────────────────────────
+
+class CircuitBreaker {
+  /**
+   * @param {number} [failureThreshold=5] - Number of failures before opening
+   * @param {number} [resetWindowMs=60000] - Window in ms to count failures
+   */
+  constructor(failureThreshold = 5, resetWindowMs = 60000) {
+    this.failureThreshold = failureThreshold;
+    this.resetWindowMs = resetWindowMs;
+    this.failures = [];
+  }
+
+  /** Record a failed reason() call. */
+  recordFailure() {
+    this.failures.push(Date.now());
+    this.failures = this.failures.filter((t) => Date.now() - t < this.resetWindowMs);
+  }
+
+  /** Record a successful reason() call — resets failure count. */
+  recordSuccess() {
+    this.failures = [];
+  }
+
+  /** True if the circuit is open (too many recent failures). */
+  isOpen() {
+    return this.failures.length >= this.failureThreshold;
+  }
+
+  /** Returns current circuit status. */
+  getStatus() {
+    return {
+      closed: !this.isOpen(),
+      failures: this.failures.length,
+      lastFailure: this.failures[this.failures.length - 1] ?? null,
+    };
+  }
+}
+
+// ─────────────────────────────────────────────
 // 1. ACTIVATION HARNESS
 //    The ears and clock of the agent.
 // ─────────────────────────────────────────────
@@ -522,7 +564,12 @@ class ToolRegistry {
     return tool.execute(params);
   }
   list() {
-    return [...this.tools.values()].map((t) => ({ id: t.id, name: t.name, description: t.description }));
+    return [...this.tools.values()].map((t) => ({
+      id: t.id,
+      name: t.name,
+      description: t.description,
+      riskLevel: t.riskLevel ?? 'safe',
+    }));
   }
 }
 
@@ -551,11 +598,18 @@ class ActionValidator {
     return this._teamGetter ? await this._teamGetter() : [];
   }
 
+  _findTool(toolId) {
+    return this.tools.get(toolId) ?? null;
+  }
+
   /**
    * Validate an action returned by the LLM's decide phase.
    * Returns { valid: boolean, error?: string }
+   * @param {Object} action - the action to validate
+   * @param {string} [route='self'] - routing context
+   * @param {Object} [step] - optional step definition with allowedTools/blockedTools
    */
-  async validate(action, route = 'self') {
+  async validate(action, route = 'self', step = null) {
     if (!action || typeof action !== 'object') {
       return { valid: false, error: 'Action is not an object' };
     }
@@ -600,6 +654,22 @@ class ActionValidator {
       }
     }
 
+    // 6. Tool allowlist/blocklist (per-step permissions)
+    if (step) {
+      const { allowedTools, blockedTools } = step;
+      if (blockedTools?.includes(action.toolId)) {
+        return { valid: false, error: `Tool '${action.toolId}' is blocked for this step` };
+      }
+      if (allowedTools?.length > 0 && !allowedTools.includes(action.toolId)) {
+        return { valid: false, error: `Tool '${action.toolId}' is not in step allowlist` };
+      }
+      // Dangerous tool requires explicit allowlist entry
+      const tool = this._findTool(action.toolId);
+      if (tool?.riskLevel === 'dangerous' && !allowedTools?.includes(action.toolId)) {
+        return { valid: false, error: `Dangerous tool '${action.toolId}' requires explicit allowlist entry` };
+      }
+    }
+
     return { valid: true };
   }
 }
@@ -610,7 +680,33 @@ class ActionValidator {
 
 class AgentKernel {
   constructor(config) {
-    this.reason = config.reason;
+    // Circuit breaker wraps the raw reason() LLM function
+    this._circuitBreaker = new CircuitBreaker(
+      config.circuitBreakerThreshold ?? 5,
+      config.circuitBreakerWindowMs ?? 60000,
+    );
+    const originalReason = config.reason;
+    this.reason = async (prompt) => {
+      if (this._circuitBreaker.isOpen()) {
+        return {
+          situationAssessment: 'circuit_open',
+          goalId: null,
+          confidence: 0,
+          answers: [],
+          revisedConfidence: 0,
+          insights: [],
+          _circuitOpen: true,
+        };
+      }
+      try {
+        const result = await originalReason(prompt);
+        this._circuitBreaker.recordSuccess();
+        return result;
+      } catch (err) {
+        this._circuitBreaker.recordFailure();
+        throw err;
+      }
+    };
     this.memory = config.memory;
     this.skills = config.skills;
     this.tools = config.tools;
@@ -655,6 +751,11 @@ class AgentKernel {
       totalEscalations: this._metrics.totalEscalations,
       totalGoalCompletes: this._metrics.totalGoalCompletes,
     };
+  }
+
+  /** Returns current circuit breaker status. */
+  getCircuitStatus() {
+    return this._circuitBreaker.getStatus();
   }
 
   _recordMetrics(result, totalDurationMs) {
@@ -1001,7 +1102,7 @@ Decide HOW to execute. Respond with JSON:
     // ── ACTION VALIDATION — kernel gate before execution ──
     const route = llmDecision.route ?? 'self';
     const action = llmDecision.action ?? {};
-    const validation = await this.validator.validate(action, route);
+    const validation = await this.validator.validate(action, route, nextStep);
     if (!validation.valid) {
       // Log the rejection and emit a failure — do NOT execute
       const decision = {
@@ -1177,7 +1278,7 @@ Decide HOW to execute. Respond with JSON:
     const shouldContinue =
       !goalComplete &&
       acted.result?.outcome?.success &&
-      acted.result?.action?.type !== 'communicate' &&
+      !(acted.result?.action?.type === 'communicate' && acted.result?.action?.awaitingResponse === true) &&
       acted.result?.action?.type !== 'wait';
 
     const integration = {
@@ -1378,6 +1479,7 @@ class InMemoryStore {
 export {
   AgentKernel,
   ActivationHarness,
+  CircuitBreaker,
   DependencyResolver,
   PatternMatcher,
   EscalationEngine,
