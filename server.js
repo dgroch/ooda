@@ -49,6 +49,8 @@ const config = {
   maxCycles: parseInt(process.env.MAX_CYCLES ?? '20'),
   webhookSecret: process.env.WEBHOOK_SECRET ?? null,
   webhookSecretOld: process.env.WEBHOOK_SECRET_OLD ?? null,
+  autoRunGoals: process.env.AUTO_RUN_GOALS !== 'false',
+  goalPollIntervalMs: parseInt(process.env.GOAL_POLL_INTERVAL_MS ?? '15000'),
 };
 
 // ─────────────────────────────────────────────
@@ -301,11 +303,20 @@ const harness = new ActivationHarness(kernel, {
 
 // Single, fixed handler for inbound webhooks to prevent unbounded event-type registration.
 harness.registerEventType('webhook_event');
+harness.registerEventType('goal_assigned');
+harness.registerEventType('goal_tick');
+harness.registerEventType('goal_resume');
 
 // Default: accept all events via webhook
 // Add filtered handlers for specific event types:
 //   harness.on('shopify_order', { filter: (p) => p.topic === 'orders/create' });
 //   harness.on('slack_message', { filter: (p) => p.channel === '#agent' });
+
+if (config.autoRunGoals) {
+  harness.cron('goal_tick', config.goalPollIntervalMs, 'Process active goals', async () => ({
+    reason: 'periodic goal processing',
+  }));
+}
 
 // ─────────────────────────────────────────────
 // HTTP Server
@@ -486,7 +497,18 @@ app.post('/goals', auth, asyncHandler(async (req, res) => {
   await memory.upsertGoal(goal);
   console.log(`[goals] Assigned: "${description}" (${goal.steps.length} steps)`);
 
-  res.json({ created: true, goal: { id: goal.id, steps: goal.steps.length } });
+  if (config.autoRunGoals) {
+    harness.emit('goal_assigned', {
+      goalId: goal.id,
+      assignedBy: goal.assignedBy,
+      description: goal.description,
+      reason: 'goal created via API',
+    }, `goal:${goal.id}`).catch((err) => {
+      console.error(`[goals] Failed to activate goal ${goal.id}:`, err.message);
+    });
+  }
+
+  res.json({ created: true, goal: { id: goal.id, steps: goal.steps.length }, activated: config.autoRunGoals });
 }));
 
 // ── GET /status ──
@@ -529,7 +551,9 @@ app.get('/status', auth, asyncHandler(async (req, res) => {
 // ── Health check helpers ──
 async function checkSqlite() {
   try {
-    store.db.exec('SELECT 1');
+    if (store?.db?.exec) {
+      store.db.exec('SELECT 1');
+    }
     return true;
   } catch { return false; }
 }
