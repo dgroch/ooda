@@ -814,7 +814,12 @@ class AgentKernel {
     }
 
     const observed  = await this._observe(trigger);
+    // ── Issue #6: Goal Planning — decompose goals that have no steps ──
     const oriented  = await this._orient(observed);
+    const goalFromOrient = oriented.activeGoals?.find((g) => g.id === oriented.orientation?.goalId);
+    if (goalFromOrient && !(goalFromOrient.steps && goalFromOrient.steps.length > 0)) {
+      await this._plan(goalFromOrient);
+    }
     const reflected = await this._reflect(oriented);
     const decided   = await this._decide(reflected);
     const acted     = await this._act(decided);
@@ -1248,6 +1253,16 @@ Decide HOW to execute. Respond with JSON:
     const t0 = Date.now();
     const goalId = reflected.orientation?.goalId;
 
+    // ── Issue #7: Snapshot in_progress steps BEFORE skill execution ──
+    let beforeSteps = new Set();
+    if (goalId) {
+      const goals = await this.memory.getGoals();
+      const goal = goals.find((g) => g.id === goalId);
+      if (goal?.steps) {
+        beforeSteps = new Set(goal.steps.filter((s) => s.status === 'in_progress').map((s) => s.id));
+      }
+    }
+
     // 1. Record episode
     await this.memory.recordEpisode({
       activationId: this._activationId,
@@ -1324,6 +1339,35 @@ Decide HOW to execute. Respond with JSON:
 
         await this.memory.upsertGoal(goal);
       }
+    }
+
+    // ── Issue #7: Detect no-progress cycles AFTER skill execution ──
+    let afterSteps = new Set();
+    if (goalId) {
+      const goals = await this.memory.getGoals();
+      const goal = goals.find((g) => g.id === goalId);
+      if (goal?.steps) {
+        afterSteps = new Set(goal.steps.filter((s) => s.status === 'done').map((s) => s.id));
+      }
+    }
+
+    const noStepCompleted = beforeSteps.size > 0 && afterSteps.size === beforeSteps.size;
+    if (noStepCompleted) {
+      this._noProgressCycles++;
+      this.memory.emit('warning', 'no_progress_cycles', { count: this._noProgressCycles, goalId });
+      if (this._noProgressCycles > this.maxNoProgressCycles) {
+        const integration = {
+          continue: false,
+          goalComplete: false,
+          progress,
+          nextContext: null,
+          noProgress: true,
+        };
+        this._emit('integrate', acted.result, integration, Date.now() - t0);
+        return integration;
+      }
+    } else {
+      this._noProgressCycles = 0;
     }
 
     const shouldContinue =
