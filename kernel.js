@@ -119,25 +119,33 @@ class ActivationHarness {
 
   async _enqueue(trigger) {
     if (this._activeCount < this.maxConcurrent) {
-      await this._run(trigger);
+      this._activeCount++;
+      this._run(trigger).finally(() => {
+        this._activeCount--;
+        this._processQueue();
+      });
     } else {
       this._queue.push(trigger);
     }
   }
 
   async _run(trigger) {
-    this._activeCount++;
     try {
       const result = await this.kernel.activate(trigger);
       this.onResult(result, trigger);
     } catch (err) {
       this.onError(err, trigger);
-    } finally {
-      this._activeCount--;
-      if (this._queue.length > 0 && this._activeCount < this.maxConcurrent) {
-        const next = this._queue.shift();
-        await this._run(next);
-      }
+    }
+  }
+
+  _processQueue() {
+    if (this._queue.length > 0 && this._activeCount < this.maxConcurrent) {
+      const next = this._queue.shift();
+      this._activeCount++;
+      this._run(next).finally(() => {
+        this._activeCount--;
+        this._processQueue();
+      });
     }
   }
 }
