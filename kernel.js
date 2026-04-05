@@ -472,6 +472,84 @@ class ToolRegistry {
 }
 
 // ─────────────────────────────────────────────
+// 7b. ACTION VALIDATOR
+//    Validates LLM output before it reaches _act().
+//    This is the gate between "LLM recommends" and "kernel executes".
+// ─────────────────────────────────────────────
+
+const VALID_ACTION_TYPES = new Set(['execute_skill', 'use_tool', 'research', 'communicate', 'wait']);
+
+class ActionValidator {
+  /**
+   * @param {Object} registries
+   * @param {SkillRegistry} registries.skills
+   * @param {ToolRegistry} registries.tools
+   * @param {Array|Function} registries.team - array or async () => team[]
+   */
+  constructor(registries) {
+    this.skills = registries.skills;
+    this.tools = registries.tools;
+    this._teamGetter = Array.isArray(registries.team) ? () => Promise.resolve(registries.team) : registries.team;
+  }
+
+  async _getTeam() {
+    return this._teamGetter ? await this._teamGetter() : [];
+  }
+
+  /**
+   * Validate an action returned by the LLM's decide phase.
+   * Returns { valid: boolean, error?: string }
+   */
+  async validate(action, route = 'self') {
+    if (!action || typeof action !== 'object') {
+      return { valid: false, error: 'Action is not an object' };
+    }
+
+    // 1. Action type must be a known type
+    if (!action.type || !VALID_ACTION_TYPES.has(action.type)) {
+      return {
+        valid: false,
+        error: `Unknown action type "${action.type}". Must be one of: ${[...VALID_ACTION_TYPES].join(', ')}`,
+      };
+    }
+
+    // 2. execute_skill must reference a registered skill
+    if (action.type === 'execute_skill') {
+      if (!action.skillId) return { valid: false, error: 'execute_skill requires skillId' };
+      if (!this.skills.has(action.skillId)) {
+        return { valid: false, error: `Skill "${action.skillId}" is not registered` };
+      }
+    }
+
+    // 3. use_tool must reference a registered tool
+    if (action.type === 'use_tool') {
+      if (!action.toolId) return { valid: false, error: 'use_tool requires toolId' };
+      if (!this.tools.has(action.toolId)) {
+        return { valid: false, error: `Tool "${action.toolId}" is not registered` };
+      }
+    }
+
+    // 4. communicate must have a valid message
+    if (action.type === 'communicate') {
+      if (!action.message) return { valid: false, error: 'communicate requires message object' };
+      if (!action.message.content) return { valid: false, error: 'communicate.message.content is required' };
+    }
+
+    // 5. delegate route must target a valid team member
+    if (route === 'delegate') {
+      const target = action.delegateTo;
+      if (!target) return { valid: false, error: 'Delegate route requires delegateTo' };
+      const team = await this._getTeam();
+      if (!team.find((m) => m.id === target)) {
+        return { valid: false, error: `Delegate target "${target}" is not in the team roster` };
+      }
+    }
+
+    return { valid: true };
+  }
+}
+
+// ─────────────────────────────────────────────
 // 8. THE KERNEL
 // ─────────────────────────────────────────────
 
@@ -489,6 +567,12 @@ class AgentKernel {
       confidenceThreshold: config.confidenceThreshold ?? 0.4,
       policyBoundaries: config.policyBoundaries ?? [],
     });
+
+    // Action validation: pluggable, defaults to built-in
+    // Pass a team-getter so validation can check delegation targets against live roster
+    const teamGetter = () => this.memory.getTeamRoster ? this.memory.getTeamRoster() : Promise.resolve([]);
+    const defaultValidator = new ActionValidator({ skills: this.skills, tools: this.tools, team: teamGetter });
+    this.validator = config.validator ?? defaultValidator;
 
     this._cycleCount = 0;
     this._activationId = null;
@@ -822,6 +906,25 @@ Decide HOW to execute. Respond with JSON:
       }),
     );
 
+    // ── ACTION VALIDATION — kernel gate before execution ──
+    const route = llmDecision.route ?? 'self';
+    const action = llmDecision.action ?? {};
+    const validation = await this.validator.validate(action, route);
+    if (!validation.valid) {
+      // Log the rejection and emit a failure — do NOT execute
+      const decision = {
+        route: 'self',
+        reasoning: `Action rejected by validator: ${validation.error}`,
+        action: { type: 'wait' }, // safe fallback
+        nextStepId: nextStep?.id,
+        structuralOverride: false,
+        validationFailed: true,
+        validationError: validation.error,
+      };
+      this._emit('decide', { nextStep, llmDecision, validationError: validation.error }, decision, Date.now() - t0);
+      return { ...reflected, decision };
+    }
+
     const decision = { ...llmDecision, nextStepId: nextStep.id, structuralOverride: false };
     this._emit('decide', { nextStep, escalationVerdict }, decision, Date.now() - t0);
     return { ...reflected, decision };
@@ -1102,5 +1205,6 @@ export {
   MemoryManager,
   SkillRegistry,
   ToolRegistry,
+  ActionValidator,
   InMemoryStore,
 };
