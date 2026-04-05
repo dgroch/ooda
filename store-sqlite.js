@@ -16,6 +16,12 @@ class SqliteStore {
    */
   constructor(dbPath = './agent.db') {
     this.db = new DatabaseSync(dbPath);
+    // Production-grade SQLite settings
+    this.db.exec(`
+      PRAGMA journal_mode=WAL;
+      PRAGMA busy_timeout=5000;
+    `);
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS kv (
         key   TEXT PRIMARY KEY,

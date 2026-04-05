@@ -169,7 +169,7 @@ class DependencyResolver {
   }
 
   /**
-   * Topological sort. Throws on cycles.
+   * Topological sort. Throws on cycles or orphaned dependencies.
    */
   static topoSort(steps) {
     const graph = new Map(steps.map((s) => [s.id, s]));
@@ -180,6 +180,7 @@ class DependencyResolver {
     const visit = (id) => {
       if (visited.has(id)) return;
       if (visiting.has(id)) throw new Error(`Dependency cycle at step: ${id}`);
+      if (!graph.has(id)) throw new Error(`Orphaned dependency: step references "${id}" which does not exist`);
       visiting.add(id);
       const step = graph.get(id);
       if (step) {
@@ -192,6 +193,22 @@ class DependencyResolver {
 
     for (const s of steps) visit(s.id);
     return sorted;
+  }
+
+  /**
+   * Validate step definitions. Returns { valid, errors }.
+   */
+  static validate(steps) {
+    const errors = [];
+    const ids = new Set(steps.map((s) => s.id));
+    for (const s of steps) {
+      for (const dep of s.dependencies ?? []) {
+        if (!ids.has(dep)) {
+          errors.push(`Step "${s.id}" depends on "${dep}" which does not exist`);
+        }
+      }
+    }
+    return { valid: errors.length === 0, errors };
   }
 
   /**
@@ -240,28 +257,44 @@ class PatternMatcher {
   }
 
   static _evalCondition(condition, state) {
-    if (condition.endsWith(':exists')) {
-      const key = condition.slice(0, -7);
-      return state[key] !== undefined && state[key] !== null;
+    // ── OR / NOT wrappers ──────────────────────────────
+    if (condition.type === 'or') {
+      return (condition.conditions ?? []).some((c) =>
+        PatternMatcher._evalCondition(c, state),
+      );
+    }
+    if (condition.type === 'not') {
+      return !PatternMatcher._evalCondition(condition.condition, state);
     }
 
-    if (condition.includes(':contains:')) {
-      const parts = condition.split(':contains:');
+    // ── String condition ───────────────────────────────
+    const cond = condition.condition ?? condition;
+
+    // exists:key  (prefix form — unambiguous over key names)
+    if (cond.startsWith('exists:')) {
+      const key = cond.slice(7);
+      return key in state && state[key] !== undefined && state[key] !== null;
+    }
+
+    // key:contains:value
+    if (cond.includes(':contains:')) {
+      const parts = cond.split(':contains:');
       const key = parts[0];
-      const value = parts[1];
+      const value = parts.slice(1).join(':contains:'); // allow :contains: in value
       const stateVal = state[key];
       if (Array.isArray(stateVal)) return stateVal.includes(value);
       if (typeof stateVal === 'string') return stateVal.includes(value);
       return false;
     }
 
+    // Operators
     const ops = ['>=', '<=', '!=', '>', '<', '='];
     for (const op of ops) {
-      const idx = condition.indexOf(op);
+      const idx = cond.indexOf(op);
       if (idx === -1) continue;
 
-      const key = condition.slice(0, idx).trim();
-      const rawValue = condition.slice(idx + op.length).trim();
+      const key = cond.slice(0, idx).trim();
+      const rawValue = cond.slice(idx + op.length).trim();
       const stateVal = state[key];
       if (stateVal === undefined) return false;
 
@@ -412,6 +445,11 @@ class MemoryManager {
   async addKnowledge(entry) {
     const items = await this.getKnowledge();
     items.push({ ...entry, learnedAt: new Date().toISOString() });
+    // Evict lowest-confidence entries when we exceed 1000
+    if (items.length > 1000) {
+      items.sort((a, b) => (a.confidence ?? 0.5) - (b.confidence ?? 0.5));
+      items.splice(0, items.length - 1000);
+    }
     await this.store.set('knowledge', items);
   }
 
