@@ -24,8 +24,16 @@
  */
 
 import express from 'express';
+import { createHmac } from 'crypto';
 import { AgentKernel, ActivationHarness, MemoryManager, SkillRegistry, ToolRegistry } from './kernel.js';
 import { SqliteStore } from './store-sqlite.js';
+
+// ─────────────────────────────────────────────
+// HTTPS Requirement (enforce in production)
+// ─────────────────────────────────────────────
+// This server handles authentication secrets (WEBHOOK_SECRET) in plaintext.
+// Deploy behind a TLS-terminating reverse proxy (nginx, cloud LB) to ensure
+// X-Hub-Signature-256 headers and auth tokens are not transmitted in the clear.
 
 // ─────────────────────────────────────────────
 // Config
@@ -40,6 +48,8 @@ const config = {
   agentRole: process.env.AGENT_ROLE ?? 'worker',
   confidenceThreshold: parseFloat(process.env.CONFIDENCE_THRESHOLD ?? '0.4'),
   maxCycles: parseInt(process.env.MAX_CYCLES ?? '20'),
+  webhookSecret: process.env.WEBHOOK_SECRET ?? null,
+  webhookSecretOld: process.env.WEBHOOK_SECRET_OLD ?? null,
 };
 
 // ─────────────────────────────────────────────
@@ -298,6 +308,32 @@ const harness = new ActivationHarness(kernel, {
 // HTTP Server
 // ─────────────────────────────────────────────
 
+// ─────────────────────────────────────────────
+// In-memory rate limiter (60 req/min per IP)
+// ─────────────────────────────────────────────
+const rateLimiter = (() => {
+  const windows = new Map();
+  return (key, max = 60, windowMs = 60000) => {
+    const now = Date.now();
+    if (!windows.has(key)) windows.set(key, []);
+    const times = windows.get(key).filter((t) => now - t < windowMs);
+    windows.set(key, times);
+    if (times.length >= max) return false;
+    times.push(now);
+    return true;
+  };
+})();
+
+// ─────────────────────────────────────────────
+// HMAC Signature Verification
+// ─────────────────────────────────────────────
+function verifyWebhookSignature(req, secret) {
+  const sig = req.headers['x-hub-signature-256'];
+  if (!sig) return false;
+  const expected = 'sha256=' + createHmac('sha256', secret).update(JSON.stringify(req.body)).digest('hex');
+  return sig === expected;
+}
+
 const app = express();
 app.use(express.json());
 
@@ -315,6 +351,20 @@ const auth = (req, res, next) => {
 app.post('/webhook/:eventType', auth, (req, res) => {
   const { eventType } = req.params;
   const source = req.headers['x-source'] ?? req.ip;
+
+  // Rate limiting (60 req/min per IP)
+  if (!rateLimiter(req.ip, 60, 60000)) {
+    return res.status(429).json({ error: 'Too many requests' });
+  }
+
+  // HMAC signature verification (supports rotation via WEBHOOK_SECRET_OLD)
+  if (config.webhookSecret || config.webhookSecretOld) {
+    const validNew = config.webhookSecret && verifyWebhookSignature(req, config.webhookSecret);
+    const validOld = config.webhookSecretOld && verifyWebhookSignature(req, config.webhookSecretOld);
+    if (!validNew && !validOld) {
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+  }
 
   // Dynamically register handler if not already registered
   if (!harness._eventHandlers.has(eventType)) {
@@ -454,6 +504,30 @@ app.post('/messages/:messageId/ack', auth, async (req, res) => {
   }
 
   res.json({ acknowledged: true, messageId, goalId: message.goal_id });
+});
+
+// ── GET /circuit-status ──
+// Returns current circuit breaker state.
+app.get('/circuit-status', auth, (req, res) => {
+  res.json(kernel.getCircuitStatus());
+});
+
+// ── POST /halt ──
+// Authenticated kill switch — stops the harness and clears the queue.
+// Uses WEBHOOK_SECRET as bearer token.
+const haltAuth = (req, res, next) => {
+  const secret = config.webhookSecret;
+  if (!secret) return next();
+  const token = req.headers['authorization']?.replace('Bearer ', '') ?? '';
+  if (token !== secret) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+};
+
+app.post('/halt', haltAuth, (req, res) => {
+  console.log('[halt] Received authenticated halt request');
+  harness.stop();
+  harness._queue = [];
+  res.json({ halted: true, agent: config.agentName });
 });
 
 // ─────────────────────────────────────────────

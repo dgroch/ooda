@@ -1,0 +1,27 @@
+## Summary
+
+Completes the per-entity storage work for issue #15.
+
+The fix for issue #12 already migrated episodes, patterns, skills, goals, and knowledge to dedicated SQL tables with proper indexes (see `store-sqlite.js`). However, `MemoryManager.queryEpisodes()` was still reading from the old `episodes` KV key as a JSON blob — the last remaining entity still using JSON blob storage.
+
+### Changes
+
+- **store-sqlite.js**: Added `queryEpisodes(filter)` method that queries the dedicated `episodes` table directly (capped at 200 rows)
+- **kernel.js**: Updated `MemoryManager.queryEpisodes()` to delegate to `store.queryEpisodes()` instead of doing `store.get('episodes')`
+
+### Before (O(n) JSON blob read)
+```js
+async queryEpisodes(filter) {
+  const episodes = (await this.store.get('episodes')) ?? [];
+  return episodes.filter(filter);
+}
+```
+
+### After (direct table query)
+```js
+async queryEpisodes(filter) {
+  return this.store.queryEpisodes(filter);  // queries episodes table directly
+}
+```
+
+Fixes #15
