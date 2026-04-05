@@ -210,6 +210,12 @@ class SqliteStore {
     return this._epGetRecent.all(n);
   }
 
+  async queryEpisodes(filter) {
+    // Fetch all and filter in-memory (episodes table is capped at 200 rows)
+    const rows = this._epGetRecent.all(200);
+    return rows.filter(filter);
+  }
+
   // ── Patterns ──────────────────────────────────────────
 
   async upsertPattern(pattern) {

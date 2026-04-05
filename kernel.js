@@ -425,8 +425,7 @@ class MemoryManager {
   }
 
   async queryEpisodes(filter) {
-    const episodes = (await this.store.get('episodes')) ?? [];
-    return episodes.filter(filter);
+    return this.store.queryEpisodes(filter);
   }
 
   async getSkills() {
