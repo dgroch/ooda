@@ -226,6 +226,7 @@ app.get('/status', async (req, res) => {
   const goals = await memory.getGoals();
   const episodes = await memory.getRecentEpisodes(5);
   const patterns = await memory.getPatterns();
+  const pendingMessages = await memory.getPendingMessages(config.agentName);
 
   res.json({
     agent: config.agentName,
@@ -244,12 +245,65 @@ app.get('/status', async (req, res) => {
       timestamp: e.timestamp,
     })),
     patternsTracked: patterns.length,
+    pendingMessages: pendingMessages.map((m) => ({
+      id: m.id,
+      from: m.from,
+      content: m.content,
+      goalId: m.goal_id,
+      stepId: m.step_id,
+      timestamp: m.created_at,
+      metadata: m.metadata,
+    })),
   });
 });
 
 // ── GET /health ──
 app.get('/health', (req, res) => {
   res.json({ ok: true, agent: config.agentName, uptime: process.uptime() });
+});
+
+// ── GET /messages ──
+// List pending messages for the agent (human or operator can poll this).
+app.get('/messages', auth, async (req, res) => {
+  const toAgent = req.query.to ?? config.agentName;
+  const messages = await memory.getPendingMessages(toAgent);
+  res.json({ messages });
+});
+
+// ── POST /messages/:messageId/ack ──
+// Acknowledge a pending message and resume the stalled goal.
+app.post('/messages/:messageId/ack', auth, async (req, res) => {
+  const { messageId } = req.params;
+  const { response } = req.body ?? {};
+
+  const message = await memory.getMessage(messageId);
+  if (!message) return res.status(404).json({ error: 'Message not found' });
+  if (message.status === 'acknowledged') return res.status(409).json({ error: 'Already acknowledged' });
+
+  // Acknowledge the message
+  await memory.acknowledgeMessage(messageId);
+
+  // Re-activate the stalled goal if one was attached
+  if (message.goal_id) {
+    const goals = await memory.getGoals();
+    const goal = goals.find((g) => g.id === message.goal_id);
+    if (goal) {
+      // Clear the blocked flag on the step so the goal can proceed
+      const step = goal.steps?.find((s) => s.id === message.step_id);
+      if (step && step.status === 'blocked') step.status = 'pending';
+      await memory.upsertGoal(goal);
+
+      // Fire a resume trigger — the harness will pick it up
+      await harness.emit('goal_resume', {
+        messageId,
+        response: response ?? '',
+        goalId: message.goal_id,
+        stepId: message.step_id,
+      }, `human:${message.from}`);
+    }
+  }
+
+  res.json({ acknowledged: true, messageId, goalId: message.goal_id });
 });
 
 // ─────────────────────────────────────────────

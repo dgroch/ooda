@@ -421,6 +421,21 @@ class MemoryManager {
     if (idx >= 0) items[idx] = goal; else items.push(goal);
     await this.store.set('goals', items);
   }
+
+  async getPendingMessages(toAgent) {
+    if (!this.store.getPendingMessages) return [];
+    return this.store.getPendingMessages(toAgent);
+  }
+
+  async acknowledgeMessage(msgId) {
+    if (!this.store.acknowledgeMessage) return null;
+    return this.store.acknowledgeMessage(msgId);
+  }
+
+  async getMessage(msgId) {
+    if (!this.store.getMessage) return null;
+    return this.store.getMessage(msgId);
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -489,6 +504,7 @@ class AgentKernel {
     this.memory.clearWorking();
     this.memory.setWorking('trigger', trigger);
     this.memory.setWorking('activationId', this._activationId);
+    this.memory.setWorking('researchFailed', false); // reset per-activation
     return this._cycle(trigger);
   }
 
@@ -710,17 +726,31 @@ Respond with JSON:
     });
 
     if (escalationVerdict.mustEscalate) {
+      const msgId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const pendingMessage = {
+        id: msgId,
+        from: this.identity.name,
+        to: escalationVerdict.suggestedTarget,
+        content: `I need help. ${escalationVerdict.reason}`,
+        goalId: goal?.id ?? null,
+        stepId: nextStep?.id ?? null,
+        status: 'pending',
+        metadata: {
+          reason: escalationVerdict.reason,
+          confidence,
+          cyclesOnCurrentStep: nextStep ? (this._stepCycleCounts.get(nextStep.id) ?? 0) : 0,
+        },
+      };
+      // Persist the pending message so a human can respond and resume this goal
+      if (this.memory.store?.saveMessage) {
+        await this.memory.store.saveMessage(pendingMessage);
+      }
       const decision = {
         route: 'escalate',
         reasoning: escalationVerdict.reason,
         action: {
           type: 'communicate',
-          message: {
-            to: escalationVerdict.suggestedTarget,
-            content: `I need help. ${escalationVerdict.reason}`,
-            goalId: goal?.id,
-            stepId: nextStep?.id,
-          },
+          message: pendingMessage,
         },
         nextStepId: nextStep?.id,
         structuralOverride: true,
