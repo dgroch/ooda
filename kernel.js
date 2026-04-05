@@ -61,6 +61,8 @@ class CircuitBreaker {
 // ─────────────────────────────────────────────
 
 class ActivationHarness {
+  static MAX_EVENT_TYPES = 50;
+
   /**
    * @param {AgentKernel} kernel
    * @param {Object} [options]
@@ -79,6 +81,7 @@ class ActivationHarness {
     this._activeCount = 0;
     this._queue = [];
     this._running = false;
+    this._stopped = false;
   }
 
   /**
@@ -89,6 +92,9 @@ class ActivationHarness {
    * @param {function} [options.transform] - (payload) → transformedPayload
    */
   on(eventType, options = {}) {
+    if (!this._eventHandlers.has(eventType) && this._eventHandlers.size >= ActivationHarness.MAX_EVENT_TYPES) {
+      throw new Error(`Maximum event types reached (${ActivationHarness.MAX_EVENT_TYPES})`);
+    }
     if (!this._eventHandlers.has(eventType)) {
       this._eventHandlers.set(eventType, []);
     }
@@ -99,10 +105,19 @@ class ActivationHarness {
     return this;
   }
 
+  registerEventType(eventType, options = {}) {
+    return this.on(eventType, options);
+  }
+
+  hasEventType(eventType) {
+    return this._eventHandlers.has(eventType);
+  }
+
   /**
    * Emit an inbound event. Matched handlers trigger kernel activation.
    */
   async emit(eventType, payload, source = 'external') {
+    if (this._stopped) throw this._stoppedError();
     const handlers = this._eventHandlers.get(eventType) ?? [];
     for (const handler of handlers) {
       if (!handler.filter(payload)) continue;
@@ -131,6 +146,7 @@ class ActivationHarness {
 
   start() {
     if (this._running) return;
+    this._stopped = false;
     this._running = true;
 
     for (const job of this._cronJobs) {
@@ -153,13 +169,24 @@ class ActivationHarness {
 
   stop() {
     this._running = false;
+    this._stopped = true;
     for (const job of this._cronJobs) {
       if (job.timer) clearInterval(job.timer);
       job.timer = null;
     }
   }
 
+  stopAndClear() {
+    this.stop();
+    this._queue = [];
+  }
+
+  clearQueue() {
+    this._queue = [];
+  }
+
   async _enqueue(trigger) {
+    if (this._stopped) throw this._stoppedError();
     if (this._activeCount < this.maxConcurrent) {
       this._activeCount++;
       this._run(trigger).finally(() => {
@@ -176,11 +203,16 @@ class ActivationHarness {
       const result = await this.kernel.activate(trigger);
       this.onResult(result, trigger);
     } catch (err) {
+      if (err?.code === 'HARNESS_STOPPED') {
+        console.warn('[harness] Ignored trigger after stop');
+        return;
+      }
       this.onError(err, trigger);
     }
   }
 
   _processQueue() {
+    if (this._stopped) return;
     if (this._queue.length > 0 && this._activeCount < this.maxConcurrent) {
       const next = this._queue.shift();
       this._activeCount++;
@@ -189,6 +221,12 @@ class ActivationHarness {
         this._processQueue();
       });
     }
+  }
+
+  _stoppedError() {
+    const err = new Error('Activation harness is stopped');
+    err.code = 'HARNESS_STOPPED';
+    return err;
   }
 }
 
@@ -372,6 +410,50 @@ class PatternMatcher {
   }
 }
 
+class GoalCriterion {
+  static evaluate(criterion, context) {
+    const type = criterion?.type ?? 'state_compare';
+    if (type === 'completion') return true;
+
+    if (type === 'step_done') {
+      if (!criterion.stepId) return false;
+      const steps = context.goal?.steps ?? [];
+      return steps.some((s) => s.id === criterion.stepId && s.status === 'done');
+    }
+
+    if (type === 'pattern_matched') {
+      if (!criterion.patternId) return false;
+      const matches = context.matchedPatterns ?? [];
+      return matches.some((p) => p.id === criterion.patternId);
+    }
+
+    const keyPath = criterion.keyPath ?? criterion.path;
+    const operator = criterion.operator ?? 'eq';
+    const expected = criterion.value;
+    if (!keyPath) return false;
+    const actual = GoalCriterion._getByPath(context.workingState ?? {}, keyPath);
+    return GoalCriterion._compare(actual, expected, operator);
+  }
+
+  static _getByPath(obj, keyPath) {
+    return keyPath.split('.').reduce((acc, part) => (acc == null ? undefined : acc[part]), obj);
+  }
+
+  static _compare(actual, expected, operator) {
+    switch (operator) {
+      case 'eq': return actual === expected;
+      case 'neq': return actual !== expected;
+      case 'gt': return Number(actual) > Number(expected);
+      case 'gte': return Number(actual) >= Number(expected);
+      case 'lt': return Number(actual) < Number(expected);
+      case 'lte': return Number(actual) <= Number(expected);
+      case 'contains': return Array.isArray(actual) ? actual.includes(expected) : String(actual ?? '').includes(String(expected ?? ''));
+      case 'exists': return actual !== undefined && actual !== null;
+      default: return false;
+    }
+  }
+}
+
 // ─────────────────────────────────────────────
 // 4. ESCALATION ENGINE
 //    Hard rules the LLM cannot override.
@@ -488,24 +570,11 @@ class MemoryManager {
   }
 
   async getPatterns() {
-    const rows = await this.store.listPatterns();
-    return rows.map((r) => ({
-      id: r.id,
-      condition: r.condition,
-      action: r.action,
-      priority: r.priority,
-      lastMatched: r.last_matched,
-    }));
+    return this.store.listPatterns();
   }
 
   async getKnowledge() {
-    const rows = await this.store.listKnowledge();
-    return rows.map((r) => ({
-      id: r.id,
-      fact: r.fact,
-      confidence: r.confidence,
-      learnedAt: r.learned_at,
-    }));
+    return this.store.listKnowledge();
   }
 
   async getTeamRoster() { return (await this.store.get('team')) ?? []; }
@@ -549,6 +618,11 @@ class MemoryManager {
   async getMessage(msgId) {
     if (!this.store.getMessage) return null;
     return this.store.getMessage(msgId);
+  }
+
+  async saveMessage(message) {
+    if (!this.store.saveMessage) return null;
+    return this.store.saveMessage(message);
   }
 }
 
@@ -744,11 +818,6 @@ class AgentKernel {
     const defaultValidator = new ActionValidator({ skills: this.skills, tools: this.tools, team: teamGetter });
     this.validator = config.validator ?? defaultValidator;
 
-    this._cycleCount = 0;
-    this._activationId = null;
-    this._stepCycleCounts = new Map();
-    this._noProgressCycles = 0;
-
     // Metrics
     this._metrics = {
       totalActivations: 0,
@@ -792,41 +861,46 @@ class AgentKernel {
 
   async activate(trigger) {
     const t0 = Date.now();
-    this._activationId = `act_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    this._cycleCount = 0;
-    this._stepCycleCounts.clear();
-    this._noProgressCycles = 0;
-    this.memory.clearWorking();
-    this.memory.setWorking('trigger', trigger);
-    this.memory.setWorking('activationId', this._activationId);
-    this.memory.setWorking('researchFailed', false); // reset per-activation
-    const result = await this._cycle(trigger);
+    const activation = {
+      id: `act_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      cycleCount: 0,
+      stepCycleCounts: new Map(),
+      noProgressCycles: 0,
+      shouldPauseContinuation: false,
+      working: {
+        trigger,
+        activationId: null,
+        researchFailed: false,
+      },
+    };
+    activation.working.activationId = activation.id;
+    const result = await this._cycle(activation, trigger);
     this._recordMetrics(result, Date.now() - t0);
     return result;
   }
 
   // ── OODA + Reflect Cycle ──
 
-  async _cycle(trigger) {
-    this._cycleCount++;
-    if (this._cycleCount > this.maxCycles) {
-      return { status: 'halted', reason: 'max_cycles_exceeded', cycles: this._cycleCount };
+  async _cycle(activation, trigger) {
+    activation.cycleCount++;
+    if (activation.cycleCount > this.maxCycles) {
+      return { status: 'halted', reason: 'max_cycles_exceeded', cycles: activation.cycleCount };
     }
 
-    const observed  = await this._observe(trigger);
+    const observed  = await this._observe(activation, trigger);
     // ── Issue #6: Goal Planning — decompose goals that have no steps ──
-    const oriented  = await this._orient(observed);
+    const oriented  = await this._orient(activation, observed);
     const goalFromOrient = oriented.activeGoals?.find((g) => g.id === oriented.orientation?.goalId);
     if (goalFromOrient && !(goalFromOrient.steps && goalFromOrient.steps.length > 0)) {
-      await this._plan(goalFromOrient);
+      await this._plan(activation, goalFromOrient);
     }
-    const reflected = await this._reflect(oriented);
-    const decided   = await this._decide(reflected);
-    const acted     = await this._act(decided);
-    const integration = await this._integrate(acted, reflected);
+    const reflected = await this._reflect(activation, oriented);
+    const decided   = await this._decide(activation, reflected);
+    const acted     = await this._act(activation, decided);
+    const integration = await this._integrate(activation, acted, reflected);
 
     if (integration.continue) {
-      return this._cycle({
+      return this._cycle(activation, {
         mode: 'continuation',
         source: 'kernel',
         payload: integration.nextContext,
@@ -836,7 +910,7 @@ class AgentKernel {
 
     return {
       status: integration.goalComplete ? 'complete' : 'paused',
-      cycles: this._cycleCount,
+      cycles: activation.cycleCount,
       result: acted.result?.outcome,
       goalProgress: integration.progress,
     };
@@ -844,7 +918,7 @@ class AgentKernel {
 
   // ── Phase 1: OBSERVE ──
 
-  async _observe(trigger) {
+  async _observe(activation, trigger) {
     const t0 = Date.now();
     const [goals, episodes, patterns, knowledge, team] = await Promise.all([
       this.memory.getGoals(),
@@ -879,17 +953,18 @@ class AgentKernel {
       this.memory.emit('warning', 'context_truncated', { originalTokens, finalTokens });
     }
 
-    this._emit('observe', trigger, observation, Date.now() - t0);
+    activation.working.observation = observation;
+    this._emit(activation, 'observe', trigger, observation, Date.now() - t0);
     return observation;
   }
 
   // ── Phase 2: ORIENT ──
 
-  async _orient(observation) {
+  async _orient(activation, observation) {
     const t0 = Date.now();
 
     const orientation = await this.reason(
-      this._buildPrompt('orient', {
+      this._buildPrompt(activation, 'orient', {
         identity: this.identity,
         observation: {
           trigger: observation.trigger,
@@ -915,14 +990,14 @@ Do NOT decide on actions — that happens in DECIDE.`,
       }),
     );
 
-    this.memory.setWorking('orientation', orientation);
-    this._emit('orient', observation, orientation, Date.now() - t0);
+    activation.working.orientation = orientation;
+    this._emit(activation, 'orient', observation, orientation, Date.now() - t0);
     return { ...observation, orientation };
   }
 
   // ── Phase 2.5: REFLECT (Self-Interrogation) ──
 
-  async _reflect(oriented) {
+  async _reflect(activation, oriented) {
     const t0 = Date.now();
 
     const goal = oriented.activeGoals?.find((g) => g.id === oriented.orientation?.goalId);
@@ -936,7 +1011,7 @@ Do NOT decide on actions — that happens in DECIDE.`,
     const questions = this._generateReflectionQuestions(oriented, goal, readySteps, blockedSteps);
 
     const reflection = await this.reason(
-      this._buildPrompt('reflect', {
+      this._buildPrompt(activation, 'reflect', {
         identity: this.identity,
         orientation: oriented.orientation,
         questions,
@@ -962,8 +1037,8 @@ Respond with JSON:
       }),
     );
 
-    this.memory.setWorking('reflection', reflection);
-    this._emit('reflect', { questions }, reflection, Date.now() - t0);
+    activation.working.reflection = reflection;
+    this._emit(activation, 'reflect', { questions }, reflection, Date.now() - t0);
 
     return { ...oriented, reflection, resolvedGoal: goal, readySteps, blockedSteps };
   }
@@ -1009,7 +1084,7 @@ Respond with JSON:
 
   // ── Phase 3: DECIDE ──
 
-  async _decide(reflected) {
+  async _decide(activation, reflected) {
     const t0 = Date.now();
     const goal = reflected.resolvedGoal;
     const readySteps = reflected.readySteps ?? [];
@@ -1021,8 +1096,8 @@ Respond with JSON:
 
     // Track cycles per step
     if (nextStep) {
-      const count = (this._stepCycleCounts.get(nextStep.id) ?? 0) + 1;
-      this._stepCycleCounts.set(nextStep.id, count);
+      const count = (activation.stepCycleCounts.get(nextStep.id) ?? 0) + 1;
+      activation.stepCycleCounts.set(nextStep.id, count);
     }
 
     // ── STRUCTURAL ESCALATION (before LLM) ──
@@ -1030,11 +1105,11 @@ Respond with JSON:
       confidence,
       actionType: nextStep?.skillRequired,
       hasRequiredSkill,
-      researchFailed: this.memory.getWorking('researchFailed') === true,
+      researchFailed: activation.working.researchFailed === true,
       blockedSteps,
       totalSteps: goal?.steps?.length ?? 0,
       doneSteps: (goal?.steps ?? []).filter((s) => s.status === 'done').length,
-      cyclesOnCurrentStep: nextStep ? (this._stepCycleCounts.get(nextStep.id) ?? 0) : 0,
+      cyclesOnCurrentStep: nextStep ? (activation.stepCycleCounts.get(nextStep.id) ?? 0) : 0,
       team: reflected.team,
     });
 
@@ -1052,13 +1127,11 @@ Respond with JSON:
         metadata: {
           reason: escalationVerdict.reason,
           confidence,
-          cyclesOnCurrentStep: nextStep ? (this._stepCycleCounts.get(nextStep.id) ?? 0) : 0,
+          cyclesOnCurrentStep: nextStep ? (activation.stepCycleCounts.get(nextStep.id) ?? 0) : 0,
         },
       };
       // Persist the pending message so a human can respond and resume this goal
-      if (this.memory.store?.saveMessage) {
-        await this.memory.store.saveMessage(pendingMessage);
-      }
+      await this.memory.saveMessage(pendingMessage);
       const decision = {
         route: 'escalate',
         reasoning: escalationVerdict.reason,
@@ -1069,7 +1142,7 @@ Respond with JSON:
         nextStepId: nextStep?.id,
         structuralOverride: true,
       };
-      this._emit('decide', { escalationVerdict }, decision, Date.now() - t0);
+      this._emit(activation, 'decide', { escalationVerdict }, decision, Date.now() - t0);
       return { ...reflected, decision };
     }
 
@@ -1081,7 +1154,7 @@ Respond with JSON:
         action: { type: 'wait' },
         nextStepId: null,
       };
-      this._emit('decide', { readySteps: [] }, decision, Date.now() - t0);
+      this._emit(activation, 'decide', { readySteps: [] }, decision, Date.now() - t0);
       return { ...reflected, decision };
     }
 
@@ -1098,7 +1171,7 @@ Respond with JSON:
         },
         nextStepId: nextStep.id,
       };
-      this._emit('decide', { skillGap: nextStep.skillRequired }, decision, Date.now() - t0);
+      this._emit(activation, 'decide', { skillGap: nextStep.skillRequired }, decision, Date.now() - t0);
       return { ...reflected, decision };
     }
 
@@ -1107,7 +1180,7 @@ Respond with JSON:
 
     // ── LLM DECIDE — within guardrails ──
     const llmDecision = await this.reason(
-      this._buildPrompt('decide', {
+      this._buildPrompt(activation, 'decide', {
         identity: this.identity,
         orientation: reflected.orientation,
         reflection: reflected.reflection,
@@ -1170,12 +1243,12 @@ Decide HOW to execute. Respond with JSON:
         validationFailed: true,
         validationError: validation.error,
       };
-      this._emit('decide', { nextStep, llmDecision, validationError: validation.error }, decision, Date.now() - t0);
+      this._emit(activation, 'decide', { nextStep, llmDecision, validationError: validation.error }, decision, Date.now() - t0);
       return { ...reflected, decision };
     }
 
     const decision = { ...llmDecision, nextStepId: nextStep.id, structuralOverride: false };
-    this._emit('decide', { nextStep, escalationVerdict }, decision, Date.now() - t0);
+    this._emit(activation, 'decide', { nextStep, escalationVerdict }, decision, Date.now() - t0);
     return { ...reflected, decision };
   }
 
@@ -1186,12 +1259,12 @@ Decide HOW to execute. Respond with JSON:
 
   // ── Phase 4: ACT ──
 
-  async _act(decided) {
+  async _act(activation, decided) {
     const t0 = Date.now();
     const action = decided.decision?.action;
     if (!action) {
       const result = { action: null, outcome: { success: false, error: 'No action defined' } };
-      this._emit('act', null, result, Date.now() - t0);
+      this._emit(activation, 'act', null, result, Date.now() - t0);
       return { ...decided, result };
     }
 
@@ -1218,8 +1291,8 @@ Decide HOW to execute. Respond with JSON:
           break;
         }
         case 'research': {
-          outcome = await this._research(decided.decision.researchPlan);
-          if (!outcome.success) this.memory.setWorking('researchFailed', true);
+          outcome = await this._research(activation, decided.decision.researchPlan);
+          if (!outcome.success) activation.working.researchFailed = true;
           break;
         }
         case 'communicate': {
@@ -1228,6 +1301,9 @@ Decide HOW to execute. Respond with JSON:
             message: action.message,
             awaitingResponse: decided.decision.route === 'escalate',
           };
+          if (decided.decision.route === 'escalate') {
+            activation.shouldPauseContinuation = true;
+          }
           break;
         }
         case 'wait': {
@@ -1242,31 +1318,33 @@ Decide HOW to execute. Respond with JSON:
     }
 
     const result = { action, outcome };
-    this.memory.setWorking('lastResult', result);
-    this._emit('act', decided.decision, result, Date.now() - t0);
+    activation.working.lastResult = result;
+    this._emit(activation, 'act', decided.decision, result, Date.now() - t0);
     return { ...decided, result };
   }
 
   // ── Phase 5: INTEGRATE ──
 
-  async _integrate(acted, reflected) {
+  async _integrate(activation, acted, reflected) {
     const t0 = Date.now();
     const goalId = reflected.orientation?.goalId;
 
-    // ── Issue #7: Snapshot in_progress steps BEFORE skill execution ──
-    let beforeSteps = new Set();
+    // Snapshot done steps before execution for no-progress detection.
+    let beforeDoneSteps = new Set();
+    let hadStepsInProgress = false;
     if (goalId) {
       const goals = await this.memory.getGoals();
       const goal = goals.find((g) => g.id === goalId);
       if (goal?.steps) {
-        beforeSteps = new Set(goal.steps.filter((s) => s.status === 'in_progress').map((s) => s.id));
+        beforeDoneSteps = new Set(goal.steps.filter((s) => s.status === 'done').map((s) => s.id));
+        hadStepsInProgress = goal.steps.some((s) => s.status === 'in_progress' || s.status === 'pending' || s.status === 'blocked');
       }
     }
 
     // 1. Record episode
     await this.memory.recordEpisode({
-      activationId: this._activationId,
-      cycle: this._cycleCount,
+      activationId: activation.id,
+      cycle: activation.cycleCount,
       trigger: acted.trigger,
       goalId,
       action: acted.result?.action,
@@ -1318,14 +1396,19 @@ Decide HOW to execute. Respond with JSON:
 
         // Check acceptance criteria
         if (goal.criteria?.length) {
-          const checks = await Promise.all(
-            goal.criteria.map(async (c) => {
-              try { return await c.check(this.memory.working); }
-              catch { return { met: false, evidence: 'Check failed' }; }
-            }),
-          );
-          goalComplete = checks.every((c) => c.met);
-          progress = checks.filter((c) => c.met).length / checks.length;
+          const checks = goal.criteria.map((criterion) => {
+            try {
+              return GoalCriterion.evaluate(criterion, {
+                goal,
+                matchedPatterns: reflected.matchedPatterns ?? [],
+                workingState: activation.working,
+              });
+            } catch {
+              return false;
+            }
+          });
+          goalComplete = checks.every(Boolean);
+          progress = checks.length ? (checks.filter(Boolean).length / checks.length) : 0;
           if (goalComplete) goal.status = 'done';
         }
 
@@ -1341,39 +1424,41 @@ Decide HOW to execute. Respond with JSON:
       }
     }
 
-    // ── Issue #7: Detect no-progress cycles AFTER skill execution ──
-    let afterSteps = new Set();
+    // Detect no-progress cycles after execution using done-step delta.
+    let afterDoneSteps = new Set();
     if (goalId) {
       const goals = await this.memory.getGoals();
       const goal = goals.find((g) => g.id === goalId);
       if (goal?.steps) {
-        afterSteps = new Set(goal.steps.filter((s) => s.status === 'done').map((s) => s.id));
+        afterDoneSteps = new Set(goal.steps.filter((s) => s.status === 'done').map((s) => s.id));
       }
     }
 
-    const noStepCompleted = beforeSteps.size > 0 && afterSteps.size === beforeSteps.size;
+    const completedDelta = afterDoneSteps.size - beforeDoneSteps.size;
+    const noStepCompleted = hadStepsInProgress && completedDelta === 0;
     if (noStepCompleted) {
-      this._noProgressCycles++;
-      this.memory.emit('warning', 'no_progress_cycles', { count: this._noProgressCycles, goalId });
-      if (this._noProgressCycles > this.maxNoProgressCycles) {
-        const integration = {
+      activation.noProgressCycles++;
+      this.memory.emit('warning', 'no_progress_cycles', { count: activation.noProgressCycles, goalId });
+      if (activation.noProgressCycles > this.maxNoProgressCycles) {
+      const integration = {
           continue: false,
           goalComplete: false,
           progress,
           nextContext: null,
           noProgress: true,
         };
-        this._emit('integrate', acted.result, integration, Date.now() - t0);
+        this._emit(activation, 'integrate', acted.result, integration, Date.now() - t0);
         return integration;
       }
     } else {
-      this._noProgressCycles = 0;
+      activation.noProgressCycles = 0;
     }
 
     const shouldContinue =
       !goalComplete &&
       acted.result?.outcome?.success &&
-      !(acted.result?.action?.type === 'communicate' && acted.result?.action?.awaitingResponse === true) &&
+      activation.shouldPauseContinuation !== true &&
+      acted.result?.outcome?.awaitingResponse !== true &&
       acted.result?.action?.type !== 'wait';
 
     const integration = {
@@ -1383,17 +1468,17 @@ Decide HOW to execute. Respond with JSON:
       nextContext: shouldContinue ? acted.result.outcome : null,
     };
 
-    this._emit('integrate', acted.result, integration, Date.now() - t0);
+    this._emit(activation, 'integrate', acted.result, integration, Date.now() - t0);
     return integration;
   }
 
   // ── Research ──
 
-  async _research(plan) {
+  async _research(activation, plan) {
     if (!plan) return { success: false, error: 'No research plan' };
 
     const findings = await this.reason(
-      this._buildPrompt('research', {
+      this._buildPrompt(activation, 'research', {
         identity: this.identity, plan,
         availableTools: this.tools.list(),
         instructions: `RESEARCH mode. Respond with JSON:
@@ -1475,11 +1560,11 @@ Return JSON: { "summarised": [{ "id": "...", "text": "...", "tokens": N }] }`,
 
   // ── Goal Planning ──
 
-  async _plan(goal) {
+  async _plan(activation, goal) {
     if (goal.steps && goal.steps.length > 0) return null;
 
     const planResult = await this.reason(
-      this._buildPrompt('plan', {
+      this._buildPrompt(activation, 'plan', {
         identity: this.identity,
         goal: { id: goal.id, description: goal.description },
         instructions: `Decompose this goal into ordered steps. Return JSON:
@@ -1550,18 +1635,23 @@ Return JSON: { "summarised": [{ "id": "...", "text": "...", "tokens": N }] }`,
     return state;
   }
 
-  _buildPrompt(phase, context) {
+  _buildPrompt(activation, phase, context) {
+    if (typeof activation === 'string') {
+      context = phase;
+      phase = activation;
+      activation = { id: 'activation_unknown' };
+    }
     return JSON.stringify({
       phase,
-      activationId: this._activationId,
+      activationId: activation.id,
       agentIdentity: context.identity,
       ...context,
     });
   }
 
-  _emit(phase, input, output, durationMs) {
+  _emit(activation, phase, input, output, durationMs) {
     this.onPhase({
-      phase, activationId: this._activationId, cycle: this._cycleCount,
+      phase, activationId: activation.id, cycle: activation.cycleCount,
       timestamp: new Date().toISOString(), durationMs, input, output,
     });
   }
@@ -1572,7 +1662,10 @@ Return JSON: { "summarised": [{ "id": "...", "text": "...", "tokens": N }] }`,
 // ─────────────────────────────────────────────
 
 class InMemoryStore {
-  constructor() { this.data = new Map(); }
+  constructor() {
+    this.data = new Map();
+    this.messages = new Map();
+  }
   async get(key) {
     const val = this.data.get(key);
     return val !== undefined ? JSON.parse(JSON.stringify(val)) : null;
@@ -1580,6 +1673,39 @@ class InMemoryStore {
   async set(key, value) { this.data.set(key, JSON.parse(JSON.stringify(value))); }
   async delete(key) { this.data.delete(key); }
   async list(prefix) { return [...this.data.keys()].filter((k) => k.startsWith(prefix ?? '')); }
+
+  async saveMessage(msg) {
+    const item = {
+      id: msg.id,
+      from: msg.from,
+      to: msg.to,
+      content: msg.content,
+      goalId: msg.goalId ?? null,
+      stepId: msg.stepId ?? null,
+      status: msg.status ?? 'pending',
+      metadata: msg.metadata ?? {},
+      createdAt: new Date().toISOString(),
+      acknowledgedAt: null,
+    };
+    this.messages.set(item.id, item);
+    return item;
+  }
+
+  async getMessage(id) {
+    return this.messages.get(id) ?? null;
+  }
+
+  async getPendingMessages(toAgent) {
+    return [...this.messages.values()].filter((m) => m.to === toAgent && m.status === 'pending');
+  }
+
+  async acknowledgeMessage(id) {
+    const msg = this.messages.get(id);
+    if (!msg) return null;
+    msg.status = 'acknowledged';
+    msg.acknowledgedAt = new Date().toISOString();
+    return msg;
+  }
 
   // ── Episodes (atomic push + trim) ────────────────────
   async appendEpisode(episode) {
@@ -1604,13 +1730,7 @@ class InMemoryStore {
 
   async listPatterns() {
     const items = (await this.get('patterns')) ?? [];
-    return items.map((p) => ({
-      id: p.id,
-      condition: p.condition,
-      action: p.action,
-      priority: p.priority,
-      last_matched: p.lastMatched,
-    }));
+    return items;
   }
 
   // ── Skills (atomic upsert) ──────────────────────────
@@ -1652,12 +1772,7 @@ class InMemoryStore {
 
   async listKnowledge() {
     const items = (await this.get('knowledge')) ?? [];
-    return items.map((k) => ({
-      id: k.id,
-      fact: k.fact,
-      confidence: k.confidence,
-      learned_at: k.learnedAt,
-    }));
+    return items;
   }
 }
 

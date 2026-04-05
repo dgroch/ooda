@@ -24,7 +24,7 @@
  */
 
 import express from 'express';
-import { createHmac } from 'crypto';
+import { createHmac, timingSafeEqual } from 'crypto';
 import { AgentKernel, ActivationHarness, MemoryManager, SkillRegistry, ToolRegistry } from './kernel.js';
 import { SqliteStore } from './store-sqlite.js';
 
@@ -299,6 +299,9 @@ const harness = new ActivationHarness(kernel, {
   maxConcurrent: 1,
 });
 
+// Single, fixed handler for inbound webhooks to prevent unbounded event-type registration.
+harness.registerEventType('webhook_event');
+
 // Default: accept all events via webhook
 // Add filtered handlers for specific event types:
 //   harness.on('shopify_order', { filter: (p) => p.topic === 'orders/create' });
@@ -313,8 +316,22 @@ const harness = new ActivationHarness(kernel, {
 // ─────────────────────────────────────────────
 const rateLimiter = (() => {
   const windows = new Map();
+  const MAX_KEYS = 1000;
+  let lastCleanupAt = 0;
   return (key, max = 60, windowMs = 60000) => {
     const now = Date.now();
+    if (now - lastCleanupAt > 60000) {
+      for (const [k, ts] of windows.entries()) {
+        const active = ts.filter((t) => now - t < windowMs);
+        if (active.length === 0) windows.delete(k);
+        else windows.set(k, active);
+      }
+      lastCleanupAt = now;
+    }
+    if (!windows.has(key) && windows.size >= MAX_KEYS) {
+      const oldestKey = windows.keys().next().value;
+      if (oldestKey) windows.delete(oldestKey);
+    }
     if (!windows.has(key)) windows.set(key, []);
     const times = windows.get(key).filter((t) => now - t < windowMs);
     windows.set(key, times);
@@ -329,13 +346,22 @@ const rateLimiter = (() => {
 // ─────────────────────────────────────────────
 function verifyWebhookSignature(req, secret) {
   const sig = req.headers['x-hub-signature-256'];
-  if (!sig) return false;
-  const expected = 'sha256=' + createHmac('sha256', secret).update(JSON.stringify(req.body)).digest('hex');
-  return sig === expected;
+  if (!sig || typeof sig !== 'string') return false;
+  const expected = 'sha256=' + createHmac('sha256', secret).update(req.rawBody ?? Buffer.from('')).digest('hex');
+  const received = Buffer.from(sig, 'utf8');
+  const expectedBuf = Buffer.from(expected, 'utf8');
+  if (received.length !== expectedBuf.length) return false;
+  return timingSafeEqual(received, expectedBuf);
 }
 
 const app = express();
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  },
+}));
+
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 // Auth middleware (optional)
 const auth = (req, res, next) => {
@@ -366,26 +392,78 @@ app.post('/webhook/:eventType', auth, (req, res) => {
     }
   }
 
-  // Dynamically register handler if not already registered
-  if (!harness._eventHandlers.has(eventType)) {
-    harness.on(eventType);
-  }
-
   // Respond immediately — activation runs in background
   res.json({ accepted: true, eventType });
 
-  harness.emit(eventType, req.body, source).catch((err) => {
+  harness.emit('webhook_event', { eventType, payload: req.body }, source).catch((err) => {
     console.error(`[webhook] Error processing ${eventType}:`, err.message);
   });
 });
 
 // ── POST /goals ──
 // Assign a goal to the agent.
-app.post('/goals', auth, async (req, res) => {
+app.post('/goals', auth, asyncHandler(async (req, res) => {
   const { id, description, steps, criteria, assignedBy, priority } = req.body;
+  const allowedFields = new Set(['id', 'description', 'steps', 'criteria', 'assignedBy', 'priority']);
+  const unknownFields = Object.keys(req.body ?? {}).filter((k) => !allowedFields.has(k));
+  if (unknownFields.length > 0) {
+    return res.status(400).json({ error: `Unknown fields: ${unknownFields.join(', ')}` });
+  }
 
-  if (!id || !description) {
+  if (!id || !description || typeof id !== 'string' || typeof description !== 'string') {
     return res.status(400).json({ error: 'id and description required' });
+  }
+  if (id.length > 100 || description.length > 1000) {
+    return res.status(400).json({ error: 'id or description too long' });
+  }
+  if (priority != null && (!Number.isInteger(priority) || priority < 1 || priority > 10)) {
+    return res.status(400).json({ error: 'priority must be an integer between 1 and 10' });
+  }
+  if (steps != null && !Array.isArray(steps)) {
+    return res.status(400).json({ error: 'steps must be an array' });
+  }
+  if (criteria != null && !Array.isArray(criteria)) {
+    return res.status(400).json({ error: 'criteria must be an array' });
+  }
+  if ((steps?.length ?? 0) > 100) {
+    return res.status(400).json({ error: 'steps max length is 100' });
+  }
+  if ((criteria?.length ?? 0) > 20) {
+    return res.status(400).json({ error: 'criteria max length is 20' });
+  }
+
+  for (const step of (steps ?? [])) {
+    if (!step || typeof step !== 'object' || typeof step.description !== 'string' || step.description.length === 0 || step.description.length > 500) {
+      return res.status(400).json({ error: 'each step requires description (1-500 chars)' });
+    }
+    if (step.id != null && (typeof step.id !== 'string' || step.id.length > 100)) {
+      return res.status(400).json({ error: 'step.id must be a string <= 100 chars' });
+    }
+  }
+
+  const allowedCriteriaTypes = new Set(['completion', 'step_done', 'pattern_matched', 'state_compare']);
+  for (const c of (criteria ?? [])) {
+    if (!c || typeof c !== 'object') {
+      return res.status(400).json({ error: 'each criterion must be an object' });
+    }
+    if (!allowedCriteriaTypes.has(c.type)) {
+      return res.status(400).json({ error: `criterion.type must be one of: ${[...allowedCriteriaTypes].join(', ')}` });
+    }
+    if (c.type === 'step_done' && (typeof c.stepId !== 'string' || c.stepId.length > 100)) {
+      return res.status(400).json({ error: 'step_done criterion requires stepId <= 100 chars' });
+    }
+    if (c.type === 'pattern_matched' && (typeof c.patternId !== 'string' || c.patternId.length > 100)) {
+      return res.status(400).json({ error: 'pattern_matched criterion requires patternId <= 100 chars' });
+    }
+    if (c.type === 'state_compare') {
+      if (typeof c.keyPath !== 'string' || c.keyPath.length === 0 || c.keyPath.length > 200) {
+        return res.status(400).json({ error: 'state_compare criterion requires keyPath <= 200 chars' });
+      }
+      const operators = new Set(['eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'contains', 'exists']);
+      if (!operators.has(c.operator ?? 'eq')) {
+        return res.status(400).json({ error: 'invalid state_compare operator' });
+      }
+    }
   }
 
   const goal = {
@@ -409,11 +487,11 @@ app.post('/goals', auth, async (req, res) => {
   console.log(`[goals] Assigned: "${description}" (${goal.steps.length} steps)`);
 
   res.json({ created: true, goal: { id: goal.id, steps: goal.steps.length } });
-});
+}));
 
 // ── GET /status ──
 // Current agent state.
-app.get('/status', async (req, res) => {
+app.get('/status', auth, asyncHandler(async (req, res) => {
   const goals = await memory.getGoals();
   const episodes = await memory.getRecentEpisodes(5);
   const patterns = await memory.getPatterns();
@@ -440,13 +518,13 @@ app.get('/status', async (req, res) => {
       id: m.id,
       from: m.from,
       content: m.content,
-      goalId: m.goal_id,
-      stepId: m.step_id,
-      timestamp: m.created_at,
+      goalId: m.goalId,
+      stepId: m.stepId,
+      timestamp: m.createdAt,
       metadata: m.metadata,
     })),
   });
-});
+}));
 
 // ── Health check helpers ──
 async function checkSqlite() {
@@ -456,6 +534,7 @@ async function checkSqlite() {
   } catch { return false; }
 }
 async function checkLlmHealth() {
+  if (!llmConfig.apiKey) return null;
   try {
     const res = await fetch(llmConfig.baseUrl + '/models', {
       method: 'GET',
@@ -477,38 +556,38 @@ async function checkWebhookReachability() {
 }
 
 // ── GET /health ──
-app.get('/health', async (req, res) => {
+app.get('/health', asyncHandler(async (req, res) => {
   const [sqlite, llm, webhook] = await Promise.all([
     checkSqlite(),
     checkLlmHealth(),
     checkWebhookReachability(),
   ]);
   const checks = { sqlite, llm, webhook };
-  const healthy = [sqlite, llm].every(v => v === true);
+  const healthy = sqlite === true && (llm === null || llm === true);
   res.status(healthy ? 200 : 503).json({ ok: healthy, checks, timestamp: new Date().toISOString() });
-});
+}));
 
 // ── GET /metrics ──
 // Agent metrics for monitoring.
-app.get('/metrics', auth, async (req, res) => {
+app.get('/metrics', auth, asyncHandler(async (req, res) => {
   const goals = await memory.getGoals();
   res.json({
     ...kernel.getMetrics(),
     activeGoals: goals.filter((g) => g.status === 'active' || g.status === 'pending').length,
   });
-});
+}));
 
 // ── GET /messages ──
 // List pending messages for the agent (human or operator can poll this).
-app.get('/messages', auth, async (req, res) => {
+app.get('/messages', auth, asyncHandler(async (req, res) => {
   const toAgent = req.query.to ?? config.agentName;
   const messages = await memory.getPendingMessages(toAgent);
   res.json({ messages });
-});
+}));
 
 // ── POST /messages/:messageId/ack ──
 // Acknowledge a pending message and resume the stalled goal.
-app.post('/messages/:messageId/ack', auth, async (req, res) => {
+app.post('/messages/:messageId/ack', auth, asyncHandler(async (req, res) => {
   const { messageId } = req.params;
   const { response } = req.body ?? {};
 
@@ -520,12 +599,12 @@ app.post('/messages/:messageId/ack', auth, async (req, res) => {
   await memory.acknowledgeMessage(messageId);
 
   // Re-activate the stalled goal if one was attached
-  if (message.goal_id) {
+  if (message.goalId) {
     const goals = await memory.getGoals();
-    const goal = goals.find((g) => g.id === message.goal_id);
+    const goal = goals.find((g) => g.id === message.goalId);
     if (goal) {
       // Clear the blocked flag on the step so the goal can proceed
-      const step = goal.steps?.find((s) => s.id === message.step_id);
+      const step = goal.steps?.find((s) => s.id === message.stepId);
       if (step && step.status === 'blocked') step.status = 'pending';
       await memory.upsertGoal(goal);
 
@@ -533,14 +612,14 @@ app.post('/messages/:messageId/ack', auth, async (req, res) => {
       await harness.emit('goal_resume', {
         messageId,
         response: response ?? '',
-        goalId: message.goal_id,
-        stepId: message.step_id,
+        goalId: message.goalId,
+        stepId: message.stepId,
       }, `human:${message.from}`);
     }
   }
 
-  res.json({ acknowledged: true, messageId, goalId: message.goal_id });
-});
+  res.json({ acknowledged: true, messageId, goalId: message.goalId });
+}));
 
 // ── GET /circuit-status ──
 // Returns current circuit breaker state.
@@ -552,8 +631,8 @@ app.get('/circuit-status', auth, (req, res) => {
 // Authenticated kill switch — stops the harness and clears the queue.
 // Uses WEBHOOK_SECRET as bearer token.
 const haltAuth = (req, res, next) => {
-  const secret = config.webhookSecret;
-  if (!secret) return next();
+  const secret = config.webhookSecret || config.authToken;
+  if (!secret) return res.status(401).json({ error: 'Unauthorized' });
   const token = req.headers['authorization']?.replace('Bearer ', '') ?? '';
   if (token !== secret) return res.status(401).json({ error: 'Unauthorized' });
   next();
@@ -561,9 +640,14 @@ const haltAuth = (req, res, next) => {
 
 app.post('/halt', haltAuth, (req, res) => {
   console.log('[halt] Received authenticated halt request');
-  harness.stop();
-  harness._queue = [];
+  harness.stopAndClear();
   res.json({ halted: true, agent: config.agentName });
+});
+
+app.use((err, req, res, next) => {
+  console.error('[error]', err.message);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'Internal error', message: err.message });
 });
 
 // ─────────────────────────────────────────────
