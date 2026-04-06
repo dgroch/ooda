@@ -2170,8 +2170,13 @@ Return ONLY JSON matching this schema exactly:
   async _triggerRetryOnLearn(activation, acquisitionEvent) {
     try {
       if (!activation?.working) return { triggered: false, reason: 'Missing activation context' };
-      const goalId = acquisitionEvent?.gapContext?.goalId ?? null;
-      const stepId = acquisitionEvent?.gapContext?.stepId ?? null;
+      // Try gapContext first, fall back to activation working state
+      const goalId = acquisitionEvent?.gapContext?.goalId
+        ?? activation.working.orientation?.goalId
+        ?? null;
+      const stepId = acquisitionEvent?.gapContext?.stepId
+        ?? activation.working.lastDecision?.nextStepId
+        ?? null;
       const gapId = acquisitionEvent?.gapContext?.gapId ?? null;
       if (!goalId || !stepId) return { triggered: false, reason: 'Missing goalId/stepId in acquisition event' };
 
