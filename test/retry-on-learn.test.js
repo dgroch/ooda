@@ -176,3 +176,159 @@ test('integration: acquisition event triggers retry and re-queues blocked step',
   assert.equal(activation.working.retryContext.acquiredCapability.id, 'skill_new');
   assert.equal(await memory.getRetryCount('step_1'), 1);
 });
+
+test('_orient: pins selected goal to retry context goal when present', async () => {
+  const store = new InMemoryStore();
+  const memory = new MemoryManager(store);
+  const skills = new SkillRegistry();
+  const tools = new ToolRegistry();
+
+  await memory.upsertGoal({
+    id: 'goal_1',
+    description: 'Retry target goal',
+    status: 'active',
+    priority: 1,
+    steps: [{ id: 'step_1', description: 'Retry this step', status: 'pending', dependencies: [] }],
+  });
+  await memory.upsertGoal({
+    id: 'goal_2',
+    description: 'Competing goal',
+    status: 'active',
+    priority: 10,
+    steps: [{ id: 'step_2', description: 'Other step', status: 'pending', dependencies: [] }],
+  });
+
+  const kernel = new AgentKernel({
+    memory,
+    skills,
+    tools,
+    reason: async () => ({
+      situationAssessment: 'Focus on goal_2',
+      goalId: 'goal_2',
+      knowledgeGaps: [],
+      confidence: 0.9,
+    }),
+  });
+
+  const activation = {
+    working: {
+      retryContext: { goalId: 'goal_1', stepId: 'step_1' },
+    },
+  };
+
+  const observed = await kernel._observe(activation, {
+    mode: 'event',
+    source: 'test',
+    eventType: 'manual',
+    payload: { goalId: 'goal_2' },
+    timestamp: new Date().toISOString(),
+  });
+  const oriented = await kernel._orient(activation, observed);
+
+  assert.equal(oriented.orientation.goalId, 'goal_1');
+});
+
+test('_decide: prioritizes retry target step when multiple steps are ready', async () => {
+  const store = new InMemoryStore();
+  const memory = new MemoryManager(store);
+  const skills = new SkillRegistry();
+  const tools = new ToolRegistry();
+
+  const kernel = new AgentKernel({
+    memory,
+    skills,
+    tools,
+    reason: async () => ({ route: 'self', action: { type: 'wait' } }),
+  });
+
+  const stepA = { id: 'step_a', description: 'Non-retry step', status: 'pending', dependencies: [] };
+  const stepB = { id: 'step_b', description: 'Retry step', status: 'pending', dependencies: [] };
+  const goal = { id: 'goal_1', description: 'Goal', status: 'active', steps: [stepA, stepB] };
+
+  const activation = {
+    stepCycleCounts: new Map(),
+    working: {
+      retryContext: { goalId: 'goal_1', stepId: 'step_b' },
+    },
+  };
+
+  const decided = await kernel._decide(activation, {
+    resolvedGoal: goal,
+    readySteps: [stepA, stepB],
+    blockedSteps: [],
+    reflection: { revisedConfidence: 0.8 },
+    orientation: { confidence: 0.8 },
+    team: [],
+  });
+
+  assert.equal(decided.decision.nextStepId, 'step_b');
+  });
+
+test('_integrate: keeps retry context when acted step does not match retry target', async () => {
+  const store = new InMemoryStore();
+  const memory = new MemoryManager(store);
+  const skills = new SkillRegistry();
+  const tools = new ToolRegistry();
+
+  await memory.upsertGoal({
+    id: 'goal_1',
+    description: 'Retry target goal',
+    status: 'active',
+    steps: [{ id: 'step_1', description: 'Retry step', status: 'pending', dependencies: [] }],
+  });
+  await memory.upsertGoal({
+    id: 'goal_2',
+    description: 'Other goal',
+    status: 'active',
+    steps: [{ id: 'step_2', description: 'Other step', status: 'pending', dependencies: [] }],
+  });
+
+  const kernel = new AgentKernel({
+    memory,
+    skills,
+    tools,
+    reason: async () => ({ ok: true }),
+  });
+
+  const goals = await memory.getGoals();
+  const goal2 = goals.find((g) => g.id === 'goal_2');
+
+  const activation = {
+    noProgressCycles: 0,
+    shouldPauseContinuation: false,
+    stepCycleCounts: new Map(),
+    working: {
+      retryContext: {
+        goalId: 'goal_1',
+        stepId: 'step_1',
+        retryCount: 1,
+        maxRetries: 2,
+        acquisitionEvent: {
+          capabilityType: 'skill',
+          capabilityId: 'skill_new',
+          gapContext: { goalId: 'goal_1', stepId: 'step_1' },
+        },
+        gap: makeGap(),
+      },
+    },
+  };
+
+  const acted = {
+    resolvedGoal: goal2,
+    decision: { nextStepId: 'step_2' },
+    readySteps: [],
+    result: {
+      action: { type: 'execute_text' },
+      outcome: { success: true, confidence: 0.9 },
+    },
+  };
+  const reflected = {
+    orientation: { goalId: 'goal_2' },
+    matchedPatterns: [],
+  };
+
+  await kernel._integrate(activation, acted, reflected);
+
+  assert.equal(activation.working.retryContext?.stepId, 'step_1');
+  assert.equal(activation.working.retryOutcome, undefined);
+});

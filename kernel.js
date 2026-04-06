@@ -1090,7 +1090,9 @@ Do NOT decide on actions — that happens in DECIDE.`,
     const highestPriorityGoal = activeGoals.length > 0
       ? [...activeGoals].sort((a, b) => (b.priority ?? 1) - (a.priority ?? 1))[0]
       : null;
-    const selectedGoal = activeGoals.find((g) => g.id === orientation?.goalId)
+    const retryGoalId = activation.working.retryContext?.goalId ?? null;
+    const selectedGoal = activeGoals.find((g) => g.id === retryGoalId)
+      ?? activeGoals.find((g) => g.id === orientation?.goalId)
       ?? activeGoals.find((g) => g.id === triggerGoalId)
       ?? highestPriorityGoal
       ?? null;
@@ -1202,7 +1204,10 @@ Respond with JSON:
     const blockedSteps = reflected.blockedSteps ?? [];
     const confidence = reflected.reflection?.revisedConfidence ?? reflected.orientation?.confidence ?? 0.5;
 
-    const nextStep = readySteps[0] ?? null;
+    const retryStepId = activation.working.retryContext?.stepId ?? null;
+    const nextStep = (retryStepId ? readySteps.find((s) => s.id === retryStepId) : null)
+      ?? readySteps[0]
+      ?? null;
     const hasRequiredSkill = nextStep ? this.skills.has(nextStep.skillRequired) : true;
 
     // Track cycles per step
@@ -1725,7 +1730,10 @@ Return JSON:
 
     let retryOutcome = null;
     const retryContext = activation.working.retryContext ?? null;
-    if (retryContext) {
+    const actedStep = this._getStepForDecision(acted);
+    const actedStepId = actedStep?.id ?? acted.decision?.nextStepId ?? null;
+    const retryStepMatched = retryContext ? retryContext.stepId === actedStepId : false;
+    if (retryContext && retryStepMatched) {
       retryOutcome = await recordRetryOutcome(
         acted.result?.outcome ?? { success: false, error: 'Missing retry outcome' },
         retryContext.gap ?? null,
@@ -1760,6 +1768,12 @@ Return JSON:
 
       activation.working.retryOutcome = retryOutcome;
       activation.working.retryContext = null;
+    } else if (retryContext) {
+      await this.memory.emit('warning', 'retry_on_learn_step_mismatch', {
+        expectedStepId: retryContext.stepId ?? null,
+        actedStepId,
+        goalId: retryContext.goalId ?? goalId ?? null,
+      });
     }
 
     // Allow continuation if: normal success conditions met, OR a retry-on-learn was just queued
