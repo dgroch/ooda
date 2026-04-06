@@ -2017,6 +2017,7 @@ Return ONLY JSON matching this schema exactly:
 
   async _processAcquisitionResult(activation, researchResult, gap, goalContext = null, stepContext = null) {
     try {
+      console.log('[acquisition] _processAcquisitionResult entered', { status: researchResult?.status, hasSkill: !!researchResult?.proposedSkill, hasPattern: !!researchResult?.proposedPattern, hasTool: !!researchResult?.proposedTool, gapId: gap?.id, goalId: goalContext?.id, stepId: stepContext?.id });
       if (!researchResult || researchResult.status !== 'resolved') return;
 
       const coProposedToolIds = researchResult.proposedTool?.id ? [researchResult.proposedTool.id] : [];
@@ -2178,7 +2179,11 @@ Return ONLY JSON matching this schema exactly:
         ?? activation.working.lastDecision?.nextStepId
         ?? null;
       const gapId = acquisitionEvent?.gapContext?.gapId ?? null;
-      if (!goalId || !stepId) return { triggered: false, reason: 'Missing goalId/stepId in acquisition event' };
+      if (!goalId || !stepId) {
+        console.log('[retry-on-learn] SKIP: missing IDs', { goalId, stepId, gapContext: acquisitionEvent?.gapContext, orientGoalId: activation.working.orientation?.goalId, decisionStepId: activation.working.lastDecision?.nextStepId });
+        return { triggered: false, reason: 'Missing goalId/stepId in acquisition event' };
+      }
+      console.log('[retry-on-learn] attempting retry', { goalId, stepId, gapId });
 
       const goals = await this.memory.getGoals();
       const goal = goals.find((g) => g.id === goalId) ?? null;
