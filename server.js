@@ -611,6 +611,30 @@ app.get('/messages', auth, asyncHandler(async (req, res) => {
   res.json({ messages });
 }));
 
+// ── POST /debug/reason ──
+// Direct smoke test for the configured LLM path.
+app.post('/debug/reason', auth, asyncHandler(async (req, res) => {
+  const prompt = req.body?.prompt;
+  if (!prompt || typeof prompt !== 'string') {
+    return res.status(400).json({ error: 'prompt (string) is required' });
+  }
+
+  const startedAt = Date.now();
+  const result = await reason(JSON.stringify({
+    phase: 'debug_reason',
+    prompt,
+    instructions: 'Return valid JSON only.',
+  }));
+
+  res.json({
+    ok: true,
+    model: llmConfig.model,
+    baseUrl: llmConfig.baseUrl,
+    durationMs: Date.now() - startedAt,
+    result,
+  });
+}));
+
 // ── POST /messages/:messageId/ack ──
 // Acknowledge a pending message and resume the stalled goal.
 app.post('/messages/:messageId/ack', auth, asyncHandler(async (req, res) => {
