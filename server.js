@@ -226,7 +226,7 @@ async function reason(prompt) {
         },
         body: JSON.stringify({
           model: llmConfig.model,
-          max_tokens: llmConfig.maxTokens,
+          max_completion_tokens: llmConfig.maxTokens,
           response_format: { type: 'json_object' },
           messages: [
             {
