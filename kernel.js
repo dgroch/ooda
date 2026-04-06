@@ -798,13 +798,11 @@ class ActionValidator {
 class AgentKernel {
   constructor(config) {
     // Circuit breaker wraps the raw reason() LLM function
-    const breakerOptions = {};
-    if (config.circuitBreakerThreshold != null) breakerOptions.failureThreshold = config.circuitBreakerThreshold;
-    if (config.circuitBreakerWindowMs != null) breakerOptions.halfOpenMs = config.circuitBreakerWindowMs;
-    if (config.circuitResetOnSuccess != null) breakerOptions.resetOnSuccess = config.circuitResetOnSuccess;
-    this.circuitBreaker = Object.keys(breakerOptions).length > 0
-      ? new CircuitBreaker(breakerOptions)
-      : new CircuitBreaker();
+    this.circuitBreaker = new CircuitBreaker({
+      failureThreshold: config.circuitBreakerThreshold,
+      halfOpenMs: config.circuitBreakerWindowMs,
+      resetOnSuccess: config.circuitResetOnSuccess,
+    });
     // Backward compatibility for existing tests/integrations.
     this._circuitBreaker = this.circuitBreaker;
     this._halfOpenProbeRemaining = 0;
@@ -823,7 +821,6 @@ class AgentKernel {
           _circuitOpen: true,
         };
       }
-
       try {
         const result = await originalReason(prompt);
         this.circuitBreaker.recordSuccess();
