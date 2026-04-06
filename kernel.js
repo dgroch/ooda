@@ -14,6 +14,28 @@
  */
 
 import { classifyGap, createGapEvent } from './gap-classifier.js';
+import {
+  createResearchObjective,
+  validateResearchResult,
+  shouldTriggerResearch,
+} from './research-contract.js';
+
+function parseLlmJson(raw) {
+  if (raw && typeof raw === 'object') return raw;
+  let text = typeof raw === 'string' ? raw : String(raw ?? '');
+  text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  text = text.replace(/,(\s*[}\]])/g, '$1');
+  text = text.replace(/'/g, '"');
+  try {
+    return JSON.parse(text);
+  } catch {
+    const start = text.search(/[[{]/);
+    if (start >= 0) {
+      try { return JSON.parse(text.slice(start)); } catch { /* noop */ }
+    }
+    return null;
+  }
+}
 
 // ─────────────────────────────────────────────
 // 0. CIRCUIT BREAKER
@@ -641,6 +663,16 @@ class MemoryManager {
     if (!this.store.getGapsByGoal) return [];
     return this.store.getGapsByGoal(goalId);
   }
+
+  async saveResearchResult(result) {
+    if (!this.store.saveResearchResult) return null;
+    return this.store.saveResearchResult(result);
+  }
+
+  async getResearchHistory(gapId) {
+    if (!this.store.getResearchHistory) return [];
+    return this.store.getResearchHistory(gapId);
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -1180,7 +1212,7 @@ Respond with JSON:
 
     // ── SKILL GAP → research ──
     if (!hasRequiredSkill) {
-      await this._detectGap(activation, {
+      const gapEvent = await this._detectGap(activation, {
         goalId: goal?.id ?? null,
         stepId: nextStep?.id ?? null,
         stepDescription: nextStep?.description ?? '',
@@ -1194,15 +1226,11 @@ Respond with JSON:
         route: 'self',
         reasoning: `Missing skill "${nextStep.skillRequired}" — entering research mode`,
         action: { type: 'research' },
-        researchPlan: {
-          topic: nextStep.skillRequired,
-          approach: `Learn how to ${nextStep.description}`,
-          stepId: nextStep.id,
-        },
+        gapEvent,
         nextStepId: nextStep.id,
       };
       activation.working.lastDecision = decision;
-      this._emit(activation, 'decide', { skillGap: nextStep.skillRequired }, decision, Date.now() - t0);
+      this._emit(activation, 'decide', { skillGap: nextStep.skillRequired, gapEvent }, decision, Date.now() - t0);
       return { ...reflected, decision };
     }
 
@@ -1377,6 +1405,7 @@ Decide HOW to execute. Respond with JSON:
   async _act(activation, decided) {
     const t0 = Date.now();
     const action = decided.decision?.action;
+    const resolvedStep = this._getStepForDecision(decided);
     if (!action) {
       const result = { action: null, outcome: { success: false, error: 'No action defined' } };
       this._emit(activation, 'act', null, result, Date.now() - t0);
@@ -1439,7 +1468,7 @@ Return JSON:
           break;
         }
         case 'research': {
-          outcome = await this._research(activation, decided.decision.researchPlan);
+          outcome = await this._research(activation, decided.decision.gapEvent, decided.resolvedGoal, resolvedStep);
           if (!outcome.success) activation.working.researchFailed = true;
           break;
         }
@@ -1465,7 +1494,6 @@ Return JSON:
       outcome = { success: false, error: err.message, stack: err.stack };
     }
 
-    const resolvedStep = this._getStepForDecision(decided);
     if (action.type === 'execute_skill' && outcome?.success === false && outcome?.needsResearch === true) {
       await this._detectGap(activation, {
         goalId: decided.resolvedGoal?.id ?? null,
@@ -1663,32 +1691,234 @@ Return JSON:
 
   // ── Research ──
 
-  async _research(activation, plan) {
-    if (!plan) return { success: false, error: 'No research plan' };
+  async _research(activation, gap, goalContext = null, stepContext = null) {
+    try {
+      if (!gap || typeof gap !== 'object') {
+        const failure = {
+          success: false,
+          type: 'research',
+          gapId: gap?.id ?? null,
+          gapType: gap?.gapType ?? null,
+          status: 'failed',
+          findings: 'Research not started: missing gap event.',
+          confidence: 0,
+          proposedSkill: null,
+          proposedPattern: null,
+          proposedTool: null,
+          evidence: [],
+          requiresHumanApproval: false,
+          validationErrors: ['Missing gap event'],
+          attempts: 0,
+        };
+        await this.memory.emit('warning', 'research_failed', failure);
+        return failure;
+      }
 
-    const findings = await this.reason(
-      this._buildPrompt(activation, 'research', {
-        identity: this.identity, plan,
-        availableTools: this.tools.list(),
-        instructions: `RESEARCH mode. Respond with JSON:
+      const gapHistory = await this.memory.getResearchHistory(gap.id);
+      if (!shouldTriggerResearch(gap, gapHistory)) {
+        return {
+          success: false,
+          type: 'research',
+          gapId: gap.id,
+          gapType: gap.gapType,
+          status: 'failed',
+          findings: `Research skipped for gap type "${gap.gapType}" or already resolved.`,
+          confidence: 0,
+          proposedSkill: null,
+          proposedPattern: null,
+          proposedTool: null,
+          evidence: [],
+          requiresHumanApproval: false,
+          skipped: true,
+          attempts: 0,
+        };
+      }
+
+      const objective = createResearchObjective(gap, goalContext ?? {}, stepContext ?? {});
+      let lastErrors = [];
+
+      for (let attempt = 1; attempt <= objective.maxAttempts; attempt++) {
+        objective.currentAttempt = attempt;
+        let parsed = null;
+        let validation = { valid: false, errors: ['No response from reason()'] };
+
+        try {
+          const raw = await this.reason(
+            this._buildPrompt(activation, 'research', {
+              identity: this.identity,
+              gap,
+              goalContext: goalContext ? {
+                id: goalContext.id ?? null,
+                description: goalContext.description ?? '',
+              } : null,
+              stepContext: stepContext ? {
+                id: stepContext.id ?? null,
+                description: stepContext.description ?? '',
+                skillRequired: stepContext.skillRequired ?? null,
+                toolsRequired: stepContext.toolsRequired ?? [],
+              } : null,
+              objective,
+              availableSkills: this.skills.list(),
+              availableTools: this.tools.list(),
+              instructions: `RESEARCH mode.
+Return ONLY JSON matching this schema exactly:
 {
-  "topic": "...",
-  "findings": "Clear, actionable summary",
-  "confidence": 0.0-1.0,
-  "newSkill": null or { "id": "...", "name": "...", "description": "...", "triggerConditions": [...], "requiredTools": [...] },
-  "newPatterns": [ { "id": "...", "description": "...", "conditions": [...], "expectedOutcome": "...", "confidence": 0.5, "occurrences": 1 } ]
+  "gapId": "string",
+  "gapType": "knowledge|procedural|tool|authority|ambiguity",
+  "status": "resolved|partial|failed",
+  "findings": "string",
+  "confidence": 0.0,
+  "proposedSkill": null or {
+    "id": "string",
+    "name": "string",
+    "description": "string",
+    "triggerConditions": ["string"],
+    "procedure": ["string"],
+    "requiredTools": ["string"],
+    "estimatedConfidence": 0.0
+  },
+  "proposedPattern": null or {
+    "id": "string",
+    "description": "string",
+    "conditions": [ {} ],
+    "expectedOutcome": "string",
+    "confidence": 0.0
+  },
+  "proposedTool": null or {
+    "id": "string",
+    "name": "string",
+    "description": "string",
+    "executeTemplate": "string",
+    "requiresInstallation": false
+  },
+  "evidence": ["string"],
+  "requiresHumanApproval": false
 }`,
-      }),
-    );
+            }),
+          );
 
-    await this.memory.addKnowledge({ topic: findings.topic, content: findings.findings, confidence: findings.confidence, source: 'self-research' });
-    if (findings.newPatterns) for (const p of findings.newPatterns) await this.memory.upsertPattern(p);
-    if (findings.newSkill) await this.memory.addSkill(findings.newSkill);
+          parsed = parseLlmJson(raw);
+          validation = validateResearchResult(parsed);
+        } catch (err) {
+          lastErrors = [`reason() failed: ${err?.message ?? 'unknown error'}`];
+          await this.memory.saveResearchResult({
+            gapId: gap.id,
+            gapType: gap.gapType,
+            status: 'failed',
+            findings: `Research attempt ${attempt} failed before validation.`,
+            confidence: 0,
+            proposedSkill: null,
+            proposedPattern: null,
+            proposedTool: null,
+            evidence: [],
+            requiresHumanApproval: false,
+            validationErrors: lastErrors,
+            attempt,
+            createdAt: new Date().toISOString(),
+          });
+          continue;
+        }
 
-    if (!findings.newSkill) {
-      return { success: false, error: 'no skill acquired', type: 'research', findings };
+        if (!validation.valid) {
+          lastErrors = validation.errors;
+          await this.memory.saveResearchResult({
+            gapId: gap.id,
+            gapType: gap.gapType,
+            status: 'failed',
+            findings: `Research attempt ${attempt} returned invalid schema.`,
+            confidence: 0,
+            proposedSkill: null,
+            proposedPattern: null,
+            proposedTool: null,
+            evidence: [],
+            requiresHumanApproval: false,
+            validationErrors: validation.errors,
+            attempt,
+            createdAt: new Date().toISOString(),
+          });
+          continue;
+        }
+
+        const normalized = {
+          ...parsed,
+          gapId: gap.id,
+          gapType: gap.gapType,
+          confidence: Number(parsed.confidence ?? 0),
+        };
+
+        if (normalized.confidence < 0.4 && normalized.status === 'resolved') {
+          normalized.status = 'partial';
+        }
+
+        const persisted = {
+          ...normalized,
+          attempt,
+          createdAt: new Date().toISOString(),
+        };
+        await this.memory.saveResearchResult(persisted);
+
+        if (normalized.findings) {
+          await this.memory.addKnowledge({
+            topic: objective.topic,
+            content: normalized.findings,
+            confidence: normalized.confidence,
+            source: 'self-research',
+          });
+        }
+
+        if (normalized.proposedPattern) {
+          await this.memory.upsertPattern(normalized.proposedPattern);
+        }
+
+        if (normalized.proposedSkill) {
+          await this.memory.addSkill(normalized.proposedSkill);
+        }
+
+        return {
+          success: normalized.status !== 'failed',
+          type: 'research',
+          attempts: attempt,
+          ...normalized,
+          humanApprovalRequired: normalized.requiresHumanApproval === true,
+        };
+      }
+
+      const failure = {
+        success: false,
+        type: 'research',
+        gapId: gap.id,
+        gapType: gap.gapType,
+        status: 'failed',
+        findings: 'Research failed after validation retries.',
+        confidence: 0,
+        proposedSkill: null,
+        proposedPattern: null,
+        proposedTool: null,
+        evidence: [],
+        requiresHumanApproval: false,
+        validationErrors: lastErrors,
+        attempts: objective.maxAttempts,
+      };
+      await this.memory.emit('warning', 'research_failed', failure);
+      return failure;
+    } catch (err) {
+      await this.memory.emit('warning', 'research_failed', { gapId: gap?.id, error: err.message, source: 'outer_catch' });
+      return {
+        success: false,
+        type: 'research',
+        gapId: gap?.id ?? null,
+        gapType: gap?.gapType ?? null,
+        status: 'failed',
+        findings: `Research failed unexpectedly: ${err?.message ?? 'unknown error'}`,
+        confidence: 0,
+        proposedSkill: null,
+        proposedPattern: null,
+        proposedTool: null,
+        evidence: [],
+        requiresHumanApproval: false,
+        attempts: 0,
+      };
     }
-    return { success: true, type: 'research', findings };
   }
 
   // ── Token Budget ──
@@ -1956,6 +2186,19 @@ class InMemoryStore {
     if (!goalId) return [];
     const gaps = (await this.get('gaps')) ?? [];
     return gaps.filter((g) => g.goalId === goalId);
+  }
+
+  async saveResearchResult(result) {
+    const results = (await this.get('research_results')) ?? [];
+    results.push(JSON.parse(JSON.stringify(result)));
+    await this.set('research_results', results);
+    return result;
+  }
+
+  async getResearchHistory(gapId) {
+    if (!gapId) return [];
+    const results = (await this.get('research_results')) ?? [];
+    return results.filter((r) => r.gapId === gapId);
   }
 
   // ── Episodes (atomic push + trim) ────────────────────
