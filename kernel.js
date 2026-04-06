@@ -875,6 +875,15 @@ class AgentKernel {
     };
     activation.working.activationId = activation.id;
     const result = await this._cycle(activation, trigger);
+    result.debug = {
+      activationId: activation.id,
+      trigger: activation.working.trigger,
+      orientation: activation.working.orientation ?? null,
+      reflection: activation.working.reflection ?? null,
+      decision: activation.working.lastDecision ?? null,
+      result: activation.working.lastResult ?? null,
+      integration: activation.working.lastIntegration ?? null,
+    };
     this._recordMetrics(result, Date.now() - t0);
     return result;
   }
@@ -1124,6 +1133,7 @@ Respond with JSON:
         action: { type: 'wait' },
         nextStepId: null,
       };
+      activation.working.lastDecision = decision;
       this._emit(activation, 'decide', { readySteps: [] }, decision, Date.now() - t0);
       return { ...reflected, decision };
     }
@@ -1141,6 +1151,7 @@ Respond with JSON:
         },
         nextStepId: nextStep.id,
       };
+      activation.working.lastDecision = decision;
       this._emit(activation, 'decide', { skillGap: nextStep.skillRequired }, decision, Date.now() - t0);
       return { ...reflected, decision };
     }
@@ -1165,6 +1176,7 @@ Respond with JSON:
         nextStepId: nextStep.id,
         structuralOverride: true,
       };
+      activation.working.lastDecision = decision;
       this._emit(activation, 'decide', { nextStep, mode: 'default_text_execution' }, decision, Date.now() - t0);
       return { ...reflected, decision };
     }
@@ -1210,6 +1222,7 @@ Respond with JSON:
         nextStepId: nextStep?.id,
         structuralOverride: true,
       };
+      activation.working.lastDecision = decision;
       this._emit(activation, 'decide', { escalationVerdict }, decision, Date.now() - t0);
       return { ...reflected, decision };
     }
@@ -1282,11 +1295,13 @@ Decide HOW to execute. Respond with JSON:
         validationFailed: true,
         validationError: validation.error,
       };
+      activation.working.lastDecision = decision;
       this._emit(activation, 'decide', { nextStep, llmDecision, validationError: validation.error }, decision, Date.now() - t0);
       return { ...reflected, decision };
     }
 
     const decision = { ...llmDecision, nextStepId: nextStep.id, structuralOverride: false };
+    activation.working.lastDecision = decision;
     this._emit(activation, 'decide', { nextStep, escalationVerdict }, decision, Date.now() - t0);
     return { ...reflected, decision };
   }
@@ -1450,7 +1465,7 @@ Return JSON:
 
         // Mark completed step — only for actual execution, not comms/wait/research
         const actionType = acted.result?.action?.type;
-        const isExecution = actionType === 'execute_skill' || actionType === 'use_tool';
+        const isExecution = actionType === 'execute_skill' || actionType === 'use_tool' || actionType === 'execute_text';
         if (isExecution && acted.result?.outcome?.success && acted.decision?.nextStepId) {
           const step = steps.find((s) => s.id === acted.decision.nextStepId);
           if (step && step.status !== 'done') step.status = 'done';
@@ -1519,6 +1534,7 @@ Return JSON:
           nextContext: null,
           noProgress: true,
         };
+        activation.working.lastIntegration = integration;
         this._emit(activation, 'integrate', acted.result, integration, Date.now() - t0);
         return integration;
       }
@@ -1540,6 +1556,7 @@ Return JSON:
       nextContext: shouldContinue ? acted.result.outcome : null,
     };
 
+    activation.working.lastIntegration = integration;
     this._emit(activation, 'integrate', acted.result, integration, Date.now() - t0);
     return integration;
   }

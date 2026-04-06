@@ -635,6 +635,27 @@ app.post('/debug/reason', auth, asyncHandler(async (req, res) => {
   });
 }));
 
+// ── POST /debug/activate ──
+// Trigger one activation and return full debug state for diagnosis.
+app.post('/debug/activate', auth, asyncHandler(async (req, res) => {
+  const trigger = {
+    mode: 'debug',
+    source: 'api:/debug/activate',
+    eventType: req.body?.eventType ?? 'debug_activate',
+    payload: req.body?.payload ?? {},
+    timestamp: new Date().toISOString(),
+  };
+
+  const startedAt = Date.now();
+  const result = await kernel.activate(trigger);
+
+  res.json({
+    ok: true,
+    durationMs: Date.now() - startedAt,
+    result,
+  });
+}));
+
 // ── POST /messages/:messageId/ack ──
 // Acknowledge a pending message and resume the stalled goal.
 app.post('/messages/:messageId/ack', auth, asyncHandler(async (req, res) => {
