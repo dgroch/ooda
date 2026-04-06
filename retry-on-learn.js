@@ -16,16 +16,24 @@ function capabilityMatchesGap(acquisitionEvent, gap) {
   if (Boolean(capabilityType) === false || Boolean(capabilityId) === false || Boolean(gap) === false) return false;
 
   const text = `${normaliseText(gap.description)} ${normaliseText(gap.reason)}`;
+  const contextSkillRequired = gap?.context?.skillRequired ?? gap?.skillRequired ?? null;
+  const contextToolsRequired = Array.isArray(gap?.context?.toolsRequired)
+    ? gap.context.toolsRequired
+    : Array.isArray(gap?.toolsRequired)
+      ? gap.toolsRequired
+      : [];
 
   if (capabilityType === 'skill') {
-    if (gap.skillRequired && gap.skillRequired === capabilityId) return true;
+    if (contextSkillRequired && contextSkillRequired === capabilityId) return true;
+    if (!contextSkillRequired && acquisitionEvent?.gapContext?.stepId && gap?.stepId && acquisitionEvent.gapContext.stepId === gap.stepId) {
+      return true;
+    }
     if (text.includes(normaliseText(capabilityId))) return true;
     return false;
   }
 
   if (capabilityType === 'tool') {
-    const toolsRequired = Array.isArray(gap.toolsRequired) ? gap.toolsRequired : [];
-    if (toolsRequired.includes(capabilityId)) return true;
+    if (contextToolsRequired.includes(capabilityId)) return true;
     if (text.includes(normaliseText(capabilityId))) return true;
     return false;
   }
@@ -43,7 +51,7 @@ function shouldRetry(acquisitionEvent, goal, gapHistory) {
       return { retry: false, reason: 'Missing acquisition event or goal' };
     }
 
-    const stepId = acquisitionEvent?.gapContext?.stepId ?? null;
+    const stepId = acquisitionEvent?.gapContext?.stepId ?? goal?.steps?.[0]?.id ?? null;
     const step = Array.isArray(goal?.steps)
       ? goal.steps.find((s) => s.id === stepId)
       : null;

@@ -2171,50 +2171,67 @@ Return ONLY JSON matching this schema exactly:
   async _triggerRetryOnLearn(activation, acquisitionEvent) {
     try {
       if (!activation?.working) return { triggered: false, reason: 'Missing activation context' };
-      // Try gapContext first, fall back to activation working state
       const goalId = acquisitionEvent?.gapContext?.goalId
         ?? activation.working.orientation?.goalId
         ?? null;
-      const stepId = acquisitionEvent?.gapContext?.stepId
+      const requestedStepId = acquisitionEvent?.gapContext?.stepId
         ?? activation.working.lastDecision?.nextStepId
         ?? null;
       const gapId = acquisitionEvent?.gapContext?.gapId ?? null;
-      if (!goalId || !stepId) {
-        console.log('[retry-on-learn] SKIP: missing IDs', { goalId, stepId, gapContext: acquisitionEvent?.gapContext, orientGoalId: activation.working.orientation?.goalId, decisionStepId: activation.working.lastDecision?.nextStepId });
-        return { triggered: false, reason: 'Missing goalId/stepId in acquisition event' };
+      if (!goalId) {
+        console.log('[retry-on-learn] SKIP: missing goalId', { goalId, requestedStepId, gapContext: acquisitionEvent?.gapContext, orientGoalId: activation.working.orientation?.goalId });
+        return { triggered: false, reason: 'Missing goalId in acquisition event' };
       }
-      console.log('[retry-on-learn] attempting retry', { goalId, stepId, gapId });
 
       const goals = await this.memory.getGoals();
       const goal = goals.find((g) => g.id === goalId) ?? null;
       if (!goal) return { triggered: false, reason: 'Goal not found for acquisition event' };
 
-      const gapHistory = await this.memory.getGapHistory(stepId);
-      const retryCount = this.memory.getRetryCount ? await this.memory.getRetryCount(stepId) : 0;
-      const verdict = shouldRetry({ ...acquisitionEvent, retryCount }, goal, gapHistory);
+      const resolvedStepId = requestedStepId
+        ?? goal.steps?.find((s) => s.id === activation.working.lastDecision?.nextStepId)?.id
+        ?? goal.steps?.find((s) => s.status === 'pending' || s.status === 'blocked' || s.status === 'in_progress')?.id
+        ?? null;
+      if (!resolvedStepId) {
+        console.log('[retry-on-learn] SKIP: could not resolve target step on goal', { goalId, requestedStepId });
+        return { triggered: false, reason: 'Missing resolvable stepId for acquisition event' };
+      }
+
+      console.log('[retry-on-learn] attempting retry', { goalId, requestedStepId, resolvedStepId, gapId });
+
+      const gapHistory = await this.memory.getGapHistory(resolvedStepId);
+      const retryCount = this.memory.getRetryCount ? await this.memory.getRetryCount(resolvedStepId) : 0;
+      const hydratedEvent = {
+        ...acquisitionEvent,
+        gapContext: {
+          ...(acquisitionEvent?.gapContext ?? {}),
+          goalId,
+          stepId: resolvedStepId,
+        },
+      };
+      const verdict = shouldRetry({ ...hydratedEvent, retryCount }, goal, gapHistory);
       if (!verdict.retry) return { triggered: false, reason: verdict.reason };
 
       const nextRetryCount = this.memory.incrementRetryCount
-        ? await this.memory.incrementRetryCount(stepId)
+        ? await this.memory.incrementRetryCount(resolvedStepId)
         : retryCount + 1;
 
-      const step = goal.steps?.find((s) => s.id === stepId) ?? null;
+      const step = goal.steps?.find((s) => s.id === resolvedStepId) ?? null;
       if (step) step.status = 'pending';
       await this.memory.upsertGoal(goal);
-      if (activation.stepCycleCounts?.delete) activation.stepCycleCounts.delete(stepId);
+      if (activation.stepCycleCounts?.delete) activation.stepCycleCounts.delete(resolvedStepId);
 
       const targetGap = gapHistory.find((g) => g.id === gapId) ?? gapHistory[gapHistory.length - 1] ?? null;
       const previousFailure = {
         error: targetGap?.lastError ?? activation.working.lastResult?.outcome?.error ?? null,
         actionType: activation.working.lastResult?.action?.type ?? null,
       };
-      const retryContext = buildRetryContext(acquisitionEvent, targetGap, previousFailure);
+      const retryContext = buildRetryContext(hydratedEvent, targetGap, previousFailure);
       activation.working.retryContext = {
         ...retryContext,
         goalId,
-        stepId,
+        stepId: resolvedStepId,
         gap: targetGap,
-        acquisitionEvent: { ...acquisitionEvent, retryCount: nextRetryCount },
+        acquisitionEvent: { ...hydratedEvent, retryCount: nextRetryCount },
         retryCount: nextRetryCount,
         maxRetries: MAX_LEARN_RETRIES,
       };
@@ -2223,7 +2240,7 @@ Return ONLY JSON matching this schema exactly:
         type: 'retry_on_learn',
         event: 'retry_queued',
         goalId,
-        stepId,
+        stepId: resolvedStepId,
         data: {
           capabilityEventId: acquisitionEvent?.id ?? null,
           capabilityType: acquisitionEvent?.capabilityType ?? acquisitionEvent?.type ?? null,
