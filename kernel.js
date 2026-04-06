@@ -808,34 +808,19 @@ class AgentKernel {
     this._halfOpenProbeRemaining = 0;
     const originalReason = config.reason;
     this.reason = async (prompt) => {
-      if (this.circuitBreaker.isOpen()) {
-        return {
-          situationAssessment: 'circuit_open',
-          goalId: null,
-          confidence: 0,
-          answers: [],
-          revisedConfidence: 0,
-          insights: [],
-          _circuitOpen: true,
-        };
-      }
-
-      if (this.circuitBreaker.isHalfOpen() && this._halfOpenProbeRemaining <= 0) {
-        return {
-          situationAssessment: 'circuit_open',
-          goalId: null,
-          confidence: 0,
-          answers: [],
-          revisedConfidence: 0,
-          insights: [],
-          _circuitOpen: true,
-        };
-      }
-
       if (this.circuitBreaker.isHalfOpen() && this._halfOpenProbeRemaining > 0) {
         this._halfOpenProbeRemaining -= 1;
+      } else if (this.circuitBreaker.isHalfOpen() && this._halfOpenProbeRemaining <= 0) {
+        return {
+          situationAssessment: 'half_open_probe_limited',
+          goalId: null,
+          confidence: 0,
+          answers: [],
+          revisedConfidence: 0,
+          insights: [],
+          _circuitOpen: true,
+        };
       }
-
       try {
         const result = await originalReason(prompt);
         this.circuitBreaker.recordSuccess();

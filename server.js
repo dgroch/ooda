@@ -522,6 +522,7 @@ app.get('/status', auth, asyncHandler(async (req, res) => {
   res.json({
     agent: config.agentName,
     role: config.agentRole,
+    circuit: kernel.circuitBreaker.getState(),
     goals: goals.map((g) => ({
       id: g.id,
       description: g.description,
@@ -588,8 +589,9 @@ app.get('/health', asyncHandler(async (req, res) => {
     checkLlmHealth(),
     checkWebhookReachability(),
   ]);
-  const checks = { sqlite, llm, webhook };
-  const healthy = sqlite === true && (llm === null || llm === true);
+  const circuitOk = !kernel.circuitBreaker.isOpen();
+  const checks = { sqlite, llm, webhook, circuitOk };
+  const healthy = sqlite === true && (llm === null || llm === true) && circuitOk;
   res.status(healthy ? 200 : 503).json({ ok: healthy, checks, timestamp: new Date().toISOString() });
 }));
 
@@ -653,6 +655,9 @@ app.post('/debug/activate', auth, asyncHandler(async (req, res) => {
     ok: true,
     durationMs: Date.now() - startedAt,
     result,
+    debug: {
+      circuitState: kernel.circuitBreaker.getState(),
+    },
   });
 }));
 
