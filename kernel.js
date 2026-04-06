@@ -355,6 +355,9 @@ class PatternMatcher {
     // ── String condition ───────────────────────────────
     const cond = condition.condition ?? condition;
 
+    // Guard: if cond is not a string (e.g. object from research-produced patterns), skip
+    if (typeof cond !== 'string') return false;
+
     // exists:key  (prefix form — unambiguous over key names)
     if (cond.startsWith('exists:')) {
       const key = cond.slice(7);
