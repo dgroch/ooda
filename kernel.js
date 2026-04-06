@@ -1677,7 +1677,11 @@ Return JSON:
 
     const completedDelta = afterDoneSteps.size - beforeDoneSteps.size;
     const noStepCompleted = hadStepsInProgress && completedDelta === 0;
-    if (noStepCompleted) {
+    // If a retry-on-learn was just queued by the acquisition pipeline, force continuation
+    // regardless of no-progress state — the retry needs one more cycle to execute.
+    const retryJustQueued = !!activation.working.retryContext;
+
+    if (noStepCompleted && !retryJustQueued) {
       activation.noProgressCycles++;
       this.memory.emit('warning', 'no_progress_cycles', { count: activation.noProgressCycles, goalId });
       if (activation.noProgressCycles > this.maxNoProgressCycles) {
@@ -1758,12 +1762,14 @@ Return JSON:
       activation.working.retryContext = null;
     }
 
+    // Allow continuation if: normal success conditions met, OR a retry-on-learn was just queued
     const shouldContinue =
-      !goalComplete &&
+      (!goalComplete &&
       acted.result?.outcome?.success &&
       activation.shouldPauseContinuation !== true &&
       acted.result?.outcome?.awaitingResponse !== true &&
-      acted.result?.action?.type !== 'wait';
+      acted.result?.action?.type !== 'wait') ||
+      retryJustQueued;
 
     const integration = {
       continue: shouldContinue,
