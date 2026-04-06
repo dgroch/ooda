@@ -13,6 +13,8 @@
  * Zero dependencies. Plug in your own LLM, storage, and tools.
  */
 
+import { classifyGap, createGapEvent } from './gap-classifier.js';
+
 // ─────────────────────────────────────────────
 // 0. CIRCUIT BREAKER
 //    Tracks consecutive LLM failures; halts reasoning when open.
@@ -624,6 +626,21 @@ class MemoryManager {
     if (!this.store.saveMessage) return null;
     return this.store.saveMessage(message);
   }
+
+  async saveGap(gap) {
+    if (!this.store.saveGap) return null;
+    return this.store.saveGap(gap);
+  }
+
+  async getGapHistory(stepId) {
+    if (!this.store.getGapHistory) return [];
+    return this.store.getGapHistory(stepId);
+  }
+
+  async getGapsByGoal(goalId) {
+    if (!this.store.getGapsByGoal) return [];
+    return this.store.getGapsByGoal(goalId);
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -895,6 +912,29 @@ class AgentKernel {
     if (activation.cycleCount > this.maxCycles) {
       return { status: 'halted', reason: 'max_cycles_exceeded', cycles: activation.cycleCount };
     }
+    if (this._circuitBreaker.isOpen()) {
+      const goals = await this.memory.getGoals();
+      const activeGoal = goals
+        .filter((g) => g.status === 'active' || g.status === 'pending')
+        .sort((a, b) => (b.priority ?? 1) - (a.priority ?? 1))[0] ?? null;
+      const step = activeGoal?.steps?.find((s) => s.status === 'pending' || s.status === 'in_progress' || s.status === 'blocked') ?? null;
+      await this._detectGap(activation, {
+        goalId: activeGoal?.id ?? trigger?.payload?.goalId ?? null,
+        stepId: step?.id ?? trigger?.payload?.stepId ?? null,
+        stepDescription: step?.description ?? trigger?.payload?.description ?? 'LLM circuit breaker is open',
+        toolsRequired: step?.toolsRequired ?? [],
+        description: 'LLM circuit breaker open; execution paused until retry window',
+        reason: 'LLM circuit breaker open',
+      }, 'tool');
+      return {
+        status: 'paused',
+        reason: 'llm_circuit_open',
+        circuitState: this.getCircuitStatus(),
+        goalId: activeGoal?.id ?? trigger?.payload?.goalId ?? null,
+        willRetryAutomatically: true,
+        cycles: activation.cycleCount,
+      };
+    }
 
     const observed  = await this._observe(activation, trigger);
     // ── Issue #6: Goal Planning — decompose goals that have no steps ──
@@ -1140,6 +1180,16 @@ Respond with JSON:
 
     // ── SKILL GAP → research ──
     if (!hasRequiredSkill) {
+      await this._detectGap(activation, {
+        goalId: goal?.id ?? null,
+        stepId: nextStep?.id ?? null,
+        stepDescription: nextStep?.description ?? '',
+        skillRequired: nextStep?.skillRequired ?? null,
+        toolsRequired: nextStep?.toolsRequired ?? [],
+        priorAttempts: nextStep ? (activation.stepCycleCounts.get(nextStep.id) ?? 0) : 0,
+        description: `Missing required skill "${nextStep?.skillRequired ?? 'unknown'}" before execution`,
+        reason: 'Missing required skill',
+      });
       const decision = {
         route: 'self',
         reasoning: `Missing skill "${nextStep.skillRequired}" — entering research mode`,
@@ -1196,6 +1246,17 @@ Respond with JSON:
 
     if (escalationVerdict.mustEscalate) {
       this._metrics.totalEscalations++;
+      await this._detectGap(activation, {
+        goalId: goal?.id ?? null,
+        stepId: nextStep?.id ?? null,
+        stepDescription: nextStep?.description ?? '',
+        skillRequired: nextStep?.skillRequired ?? null,
+        toolsRequired: nextStep?.toolsRequired ?? [],
+        priorAttempts: nextStep ? (activation.stepCycleCounts.get(nextStep.id) ?? 0) : 0,
+        escalationReason: escalationVerdict.reason,
+        description: escalationVerdict.reason ?? 'Escalation required',
+        reason: escalationVerdict.reason ?? 'Escalation required',
+      });
       const msgId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       const pendingMessage = {
         id: msgId,
@@ -1404,6 +1465,33 @@ Return JSON:
       outcome = { success: false, error: err.message, stack: err.stack };
     }
 
+    const resolvedStep = this._getStepForDecision(decided);
+    if (action.type === 'execute_skill' && outcome?.success === false && outcome?.needsResearch === true) {
+      await this._detectGap(activation, {
+        goalId: decided.resolvedGoal?.id ?? null,
+        stepId: resolvedStep?.id ?? decided.decision?.nextStepId ?? null,
+        stepDescription: resolvedStep?.description ?? '',
+        skillRequired: resolvedStep?.skillRequired ?? action.skillId ?? null,
+        toolsRequired: resolvedStep?.toolsRequired ?? [],
+        priorAttempts: resolvedStep?.id ? (activation.stepCycleCounts.get(resolvedStep.id) ?? 0) : 0,
+        lastError: outcome?.error ?? null,
+        description: `Skill execution failed and requested research: ${outcome?.error ?? 'unknown error'}`,
+        reason: outcome?.error ?? 'execute_skill failed with needsResearch',
+      });
+    }
+    if (action.type === 'execute_text' && Number(outcome?.confidence ?? 1) < 0.3) {
+      await this._detectGap(activation, {
+        goalId: decided.resolvedGoal?.id ?? null,
+        stepId: resolvedStep?.id ?? decided.decision?.nextStepId ?? null,
+        stepDescription: resolvedStep?.description ?? action.params?.description ?? '',
+        skillRequired: resolvedStep?.skillRequired ?? null,
+        toolsRequired: resolvedStep?.toolsRequired ?? [],
+        priorAttempts: resolvedStep?.id ? (activation.stepCycleCounts.get(resolvedStep.id) ?? 0) : 0,
+        description: `Text execution returned low confidence (${Number(outcome?.confidence ?? 0).toFixed(2)})`,
+        reason: 'Low confidence text execution',
+      });
+    }
+
     const result = { action, outcome };
     activation.working.lastResult = result;
     this._emit(activation, 'act', decided.decision, result, Date.now() - t0);
@@ -1527,7 +1615,19 @@ Return JSON:
       activation.noProgressCycles++;
       this.memory.emit('warning', 'no_progress_cycles', { count: activation.noProgressCycles, goalId });
       if (activation.noProgressCycles > this.maxNoProgressCycles) {
-      const integration = {
+        const resolvedStep = this._getStepForDecision(acted);
+        await this._detectGap(activation, {
+          goalId,
+          stepId: resolvedStep?.id ?? acted.decision?.nextStepId ?? null,
+          stepDescription: resolvedStep?.description ?? '',
+          skillRequired: resolvedStep?.skillRequired ?? null,
+          toolsRequired: resolvedStep?.toolsRequired ?? [],
+          priorAttempts: resolvedStep?.id ? (activation.stepCycleCounts.get(resolvedStep.id) ?? 0) : activation.noProgressCycles,
+          lastError: acted.result?.outcome?.error ?? null,
+          description: `No progress for ${activation.noProgressCycles} consecutive cycles`,
+          reason: 'No-progress threshold exceeded',
+        });
+        const integration = {
           continue: false,
           goalComplete: false,
           progress,
@@ -1676,6 +1776,49 @@ Return JSON: { "summarised": [{ "id": "...", "text": "...", "tokens": N }] }`,
 
   // ── Helpers ──
 
+  _getStepForDecision(decisionEnvelope) {
+    const goalSteps = decisionEnvelope?.resolvedGoal?.steps ?? [];
+    const nextStepId = decisionEnvelope?.decision?.nextStepId ?? null;
+    if (nextStepId) {
+      const byId = goalSteps.find((s) => s.id === nextStepId);
+      if (byId) return byId;
+    }
+    const readySteps = decisionEnvelope?.readySteps ?? [];
+    if (readySteps.length > 0) return readySteps[0];
+    return null;
+  }
+
+  async _detectGap(activation, context = {}, forcedGapType = null) {
+    const detectedBy = this.identity?.name ?? 'kernel';
+    try {
+      const classification = forcedGapType
+        ? {
+          gapType: forcedGapType,
+          confidence: 0.95,
+          reason: context.reason ?? `Forced gap type: ${forcedGapType}`,
+        }
+        : classifyGap({
+          ...context,
+          skillRegistry: this.skills.list().map((s) => s.id),
+          toolRegistry: this.tools.list().map((t) => t.id),
+        });
+      const gapEvent = createGapEvent(classification, { ...context, detectedBy });
+      if (this.memory.saveGap) await this.memory.saveGap(gapEvent);
+      if (this.memory.emit) await this.memory.emit('warning', 'gap_detected', gapEvent);
+      activation.working.lastGap = gapEvent;
+      return gapEvent;
+    } catch {
+      const fallback = createGapEvent(
+        { gapType: 'knowledge', confidence: 0.5, reason: 'Classifier fallback' },
+        { ...context, detectedBy },
+      );
+      if (this.memory.saveGap) await this.memory.saveGap(fallback);
+      if (this.memory.emit) await this.memory.emit('warning', 'gap_detected', fallback);
+      activation.working.lastGap = fallback;
+      return fallback;
+    }
+  }
+
   _buildFlatState(trigger, activeGoals, episodes) {
     const state = {
       'trigger.mode': trigger.mode,
@@ -1794,6 +1937,25 @@ class InMemoryStore {
     msg.status = 'acknowledged';
     msg.acknowledgedAt = new Date().toISOString();
     return msg;
+  }
+
+  async saveGap(gap) {
+    const gaps = (await this.get('gaps')) ?? [];
+    gaps.push(JSON.parse(JSON.stringify(gap)));
+    await this.set('gaps', gaps);
+    return gap;
+  }
+
+  async getGapHistory(stepId) {
+    if (!stepId) return [];
+    const gaps = (await this.get('gaps')) ?? [];
+    return gaps.filter((g) => g.stepId === stepId);
+  }
+
+  async getGapsByGoal(goalId) {
+    if (!goalId) return [];
+    const gaps = (await this.get('gaps')) ?? [];
+    return gaps.filter((g) => g.goalId === goalId);
   }
 
   // ── Episodes (atomic push + trim) ────────────────────
