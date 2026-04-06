@@ -798,42 +798,30 @@ class ActionValidator {
 class AgentKernel {
   constructor(config) {
     // Circuit breaker wraps the raw reason() LLM function
-    this.circuitBreaker = new CircuitBreaker({
-      failureThreshold: config.circuitBreakerThreshold,
-      halfOpenMs: config.circuitBreakerWindowMs,
-      resetOnSuccess: config.circuitResetOnSuccess,
-    });
+    const breakerOptions = {};
+    if (config.circuitBreakerThreshold != null) breakerOptions.failureThreshold = config.circuitBreakerThreshold;
+    if (config.circuitBreakerWindowMs != null) breakerOptions.halfOpenMs = config.circuitBreakerWindowMs;
+    if (config.circuitResetOnSuccess != null) breakerOptions.resetOnSuccess = config.circuitResetOnSuccess;
+    this.circuitBreaker = Object.keys(breakerOptions).length > 0
+      ? new CircuitBreaker(breakerOptions)
+      : new CircuitBreaker();
     // Backward compatibility for existing tests/integrations.
     this._circuitBreaker = this.circuitBreaker;
     this._halfOpenProbeRemaining = 0;
     const originalReason = config.reason;
     this.reason = async (prompt) => {
-      if (this.circuitBreaker.isOpen()) {
-        return {
-          situationAssessment: 'circuit_open',
-          goalId: null,
-          confidence: 0,
-          answers: [],
-          revisedConfidence: 0,
-          insights: [],
-          _circuitOpen: true,
-        };
-      }
-
-      if (this.circuitBreaker.isHalfOpen() && this._halfOpenProbeRemaining <= 0) {
-        return {
-          situationAssessment: 'circuit_open',
-          goalId: null,
-          confidence: 0,
-          answers: [],
-          revisedConfidence: 0,
-          insights: [],
-          _circuitOpen: true,
-        };
-      }
-
       if (this.circuitBreaker.isHalfOpen() && this._halfOpenProbeRemaining > 0) {
         this._halfOpenProbeRemaining -= 1;
+      } else if (this.circuitBreaker.isHalfOpen() && this._halfOpenProbeRemaining <= 0) {
+        return {
+          situationAssessment: 'half_open_probe_limited',
+          goalId: null,
+          confidence: 0,
+          answers: [],
+          revisedConfidence: 0,
+          insights: [],
+          _circuitOpen: true,
+        };
       }
 
       try {
