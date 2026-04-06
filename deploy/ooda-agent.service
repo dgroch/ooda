@@ -1,0 +1,38 @@
+[Unit]
+Description=OODA Logic Kernel Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ooda
+Group=ooda
+WorkingDirectory=/opt/ooda
+ExecStart=/usr/bin/node /opt/ooda/server.js
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/ooda/.env
+
+# Journald tagging
+SyslogIdentifier=ooda-agent
+
+# Basic hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ooda /var/log/ooda /opt/ooda
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# Limits
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

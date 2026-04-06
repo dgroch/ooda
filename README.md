@@ -152,6 +152,8 @@ docs/
 
 ## Production deployment
 
+For an EC2 handoff runbook and templates, see docs/deploy-ec2.md and files under deploy/.
+
 ### System requirements
 
 - **Node.js 22+** (tested on Node 22.x)
