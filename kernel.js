@@ -931,7 +931,42 @@ class AgentKernel {
       },
     };
     activation.working.activationId = activation.id;
+
+    // ── Cross-activation circuit breaker ──
+    // If the breaker is permanently open from too many failed activations,
+    // refuse to run and signal the caller to stop retrying.
+    if (this.circuitBreaker.isPermanentlyOpen()) {
+      const result = {
+        status: 'halted',
+        reason: 'activation_failure_limit_exceeded',
+        retryable: false,
+        circuitState: this.circuitBreaker.getState(),
+        cycles: 0,
+      };
+      this._recordMetrics(result, Date.now() - t0);
+      return result;
+    }
+
     const result = await this._cycle(activation, trigger);
+
+    // Track cross-activation outcomes for runaway-loop prevention.
+    const isFailure = result.status === 'halted'
+      || result.status === 'error'
+      || result.reason === 'llm_circuit_open'
+      || result.reason === 'max_cycles_exceeded'
+      || (result.goalProgress != null && result.goalProgress === 0 && result.status === 'paused');
+    if (isFailure) {
+      this.circuitBreaker.recordActivationFailure(result.reason ?? 'unknown');
+    } else {
+      this.circuitBreaker.recordActivationSuccess();
+    }
+
+    // Mark non-retryable if breaker just tripped permanently.
+    if (this.circuitBreaker.isPermanentlyOpen()) {
+      result.retryable = false;
+      result.circuitState = this.circuitBreaker.getState();
+    }
+
     result.debug = {
       activationId: activation.id,
       trigger: activation.working.trigger,
@@ -973,6 +1008,8 @@ class AgentKernel {
         goalId: activeGoal?.id ?? trigger?.payload?.goalId ?? null,
         willRetryAutomatically: true,
         cycles: activation.cycleCount,
+        // Don't retry immediately — the caller should check circuit state
+        retryable: true,
       };
     }
     if (this.circuitBreaker.isHalfOpen()) {

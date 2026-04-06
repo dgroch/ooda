@@ -48,6 +48,16 @@ export class CircuitBreaker {
       safeInt(process.env.CIRCUIT_RESET_ON_SUCCESS, 1),
     );
 
+    // Cross-activation failure tracking — survives across activate() calls
+    // on the same kernel instance. Prevents runaway retry loops.
+    this.totalActivationFailures = 0;
+    this.maxActivationFailures = safeInt(
+      options.maxActivationFailures,
+      safeInt(process.env.CIRCUIT_MAX_ACTIVATION_FAILURES, 10),
+    );
+    this.permanentlyOpen = false;
+    this.permanentOpenReason = null;
+
     this.state = 'closed';
     this.failureCount = 0;
     this.successCount = 0;
@@ -75,15 +85,47 @@ export class CircuitBreaker {
     }
   }
 
+  /**
+   * Record a failed activation (cross-activation tracking).
+   * Call this when an entire activate() call ends in failure/no-progress.
+   * If totalActivationFailures exceeds the threshold, the breaker locks permanently.
+   */
+  recordActivationFailure(reason) {
+    this.totalActivationFailures++;
+    if (this.totalActivationFailures >= this.maxActivationFailures) {
+      this.permanentlyOpen = true;
+      this.permanentOpenReason = `Activation failure limit reached (${this.totalActivationFailures}/${this.maxActivationFailures}): ${reason ?? 'unknown'}`;
+      this.state = 'open';
+      this.openedAt = Date.now();
+      this.openReason = this.permanentOpenReason;
+    }
+  }
+
+  /**
+   * Record a successful activation (cross-activation tracking).
+   * Resets the cross-activation failure counter.
+   */
+  recordActivationSuccess() {
+    this.totalActivationFailures = 0;
+  }
+
+  isPermanentlyOpen() {
+    return this.permanentlyOpen === true;
+  }
+
   getState() {
     this._refreshState();
     return {
-      state: this.state,
+      state: this.permanentlyOpen ? 'permanently_open' : this.state,
       failureThreshold: this.failureThreshold,
       halfOpenMs: this.halfOpenMs,
       resetOnSuccess: this.resetOnSuccess,
       failureCount: this.failureCount,
       successCount: this.successCount,
+      totalActivationFailures: this.totalActivationFailures,
+      maxActivationFailures: this.maxActivationFailures,
+      permanentlyOpen: this.permanentlyOpen,
+      permanentOpenReason: this.permanentOpenReason ?? null,
       lastFailureAt: this._toIso(this.lastFailureAt),
       openedAt: this._toIso(this.openedAt),
       openReason: this.openReason ?? null,
@@ -127,16 +169,19 @@ export class CircuitBreaker {
   }
 
   isOpen() {
+    if (this.permanentlyOpen) return true;
     this._refreshState();
     return this.state === 'open';
   }
 
   isHalfOpen() {
+    if (this.permanentlyOpen) return false;
     this._refreshState();
     return this.state === 'half-open';
   }
 
   isClosed() {
+    if (this.permanentlyOpen) return false;
     this._refreshState();
     return this.state === 'closed';
   }
@@ -148,6 +193,15 @@ export class CircuitBreaker {
     this.lastFailureAt = null;
     this.openedAt = null;
     this.openReason = null;
+    // Note: does NOT reset cross-activation counters or permanent state.
+    // Call fullReset() to clear everything including permanent lockout.
+  }
+
+  fullReset() {
+    this.reset();
+    this.totalActivationFailures = 0;
+    this.permanentlyOpen = false;
+    this.permanentOpenReason = null;
   }
 
   getNextRetryAt() {
