@@ -307,6 +307,13 @@ harness.registerEventType('goal_assigned');
 harness.registerEventType('goal_tick');
 harness.registerEventType('goal_resume');
 
+memory.on('goal_resume_requested', (payload) => {
+  if (!payload?.goalId) return;
+  harness.emit('goal_resume', payload, 'kernel:retry-on-learn').catch((err) => {
+    console.error('[harness] goal_resume emit failed:', err.message);
+  });
+});
+
 // Default: accept all events via webhook
 // Add filtered handlers for specific event types:
 //   harness.on('shopify_order', { filter: (p) => p.topic === 'orders/create' });

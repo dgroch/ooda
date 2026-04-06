@@ -28,6 +28,12 @@ import {
   validateProposedSkill,
   validateProposedTool,
 } from './acquisition.js';
+import {
+  MAX_LEARN_RETRIES,
+  buildRetryContext,
+  recordRetryOutcome,
+  shouldRetry,
+} from './retry-on-learn.js';
 
 function parseLlmJson(raw) {
   if (raw && typeof raw === 'object') return raw;
@@ -650,6 +656,21 @@ class MemoryManager {
     if (!this.store.getAcquisitionHistory) return [];
     return this.store.getAcquisitionHistory(goalId);
   }
+
+  async getRetryCount(stepId) {
+    if (!this.store.getRetryCount) return 0;
+    return this.store.getRetryCount(stepId);
+  }
+
+  async incrementRetryCount(stepId) {
+    if (!this.store.incrementRetryCount) return 0;
+    return this.store.incrementRetryCount(stepId);
+  }
+
+  async resetRetryCount(stepId) {
+    if (!this.store.resetRetryCount) return 0;
+    return this.store.resetRetryCount(stepId);
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -903,6 +924,7 @@ class AgentKernel {
         trigger,
         activationId: null,
         researchFailed: false,
+        retryContext: null,
       },
     };
     activation.working.activationId = activation.id;
@@ -1044,6 +1066,7 @@ class AgentKernel {
           storedKnowledge: observation.storedKnowledge,
           team: observation.team,
         },
+        retryContext: activation.working.retryContext ?? null,
         instructions: `ORIENT phase. The kernel has already pattern-matched for you.
 
 Respond with JSON:
@@ -1317,6 +1340,7 @@ Respond with JSON:
           id: nextStep.id, description: nextStep.description,
           skillRequired: nextStep.skillRequired, toolsRequired: nextStep.toolsRequired,
         },
+        retryContext: activation.working.retryContext ?? null,
         delegationOption: delegationTarget ? { id: delegationTarget.id, name: delegationTarget.name } : null,
         instructions: `DECIDE phase. The kernel has already:
 - Resolved dependencies (this step is ready)
@@ -1472,7 +1496,13 @@ Return JSON:
         case 'research': {
           outcome = await this._research(activation, decided.decision.gapEvent, decided.resolvedGoal, resolvedStep);
           if (outcome?.status === 'resolved') {
-            await this._processAcquisitionResult(outcome, decided.decision.gapEvent, decided.resolvedGoal, resolvedStep);
+            await this._processAcquisitionResult(
+              activation,
+              outcome,
+              decided.decision.gapEvent,
+              decided.resolvedGoal,
+              resolvedStep,
+            );
           }
           if (!outcome.success) activation.working.researchFailed = true;
           break;
@@ -1660,6 +1690,17 @@ Return JSON:
           description: `No progress for ${activation.noProgressCycles} consecutive cycles`,
           reason: 'No-progress threshold exceeded',
         });
+        const retryContext = activation.working.retryContext ?? null;
+        if (retryContext) {
+          const retryOutcome = await recordRetryOutcome(
+            acted.result?.outcome ?? { success: false, error: 'Missing retry outcome' },
+            retryContext.gap ?? null,
+            retryContext.acquisitionEvent ?? null,
+            this.memory,
+          );
+          activation.working.retryOutcome = retryOutcome;
+          activation.working.retryContext = null;
+        }
         const integration = {
           continue: false,
           goalComplete: false,
@@ -1675,6 +1716,45 @@ Return JSON:
       activation.noProgressCycles = 0;
     }
 
+    let retryOutcome = null;
+    const retryContext = activation.working.retryContext ?? null;
+    if (retryContext) {
+      retryOutcome = await recordRetryOutcome(
+        acted.result?.outcome ?? { success: false, error: 'Missing retry outcome' },
+        retryContext.gap ?? null,
+        retryContext.acquisitionEvent ?? null,
+        this.memory,
+      );
+
+      if (retryOutcome.success === false && retryOutcome.escalated === true) {
+        const team = await this.memory.getTeamRoster();
+        const escalationTarget = team.find((m) => m.role === 'senior')?.id
+          ?? team.find((m) => m.role === 'human')?.id
+          ?? 'human';
+        const pendingMessage = {
+          id: `msg_retry_escalation_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          from: this.identity.name,
+          to: escalationTarget,
+          content: `Retry-on-learn failed for step "${retryContext.stepId}" after ${retryContext.retryCount}/${retryContext.maxRetries} attempts.`,
+          goalId: retryContext.goalId ?? null,
+          stepId: retryContext.stepId ?? null,
+          status: 'pending',
+          metadata: {
+            type: 'retry_on_learn_escalation',
+            gapId: retryContext.gap?.id ?? retryContext.acquisitionEvent?.gapContext?.gapId ?? null,
+            capabilityId: retryContext.acquisitionEvent?.capabilityId ?? null,
+            retryCount: retryContext.retryCount ?? 0,
+            maxRetries: retryContext.maxRetries ?? MAX_LEARN_RETRIES,
+          },
+        };
+        await this.memory.saveMessage(pendingMessage);
+        activation.shouldPauseContinuation = true;
+      }
+
+      activation.working.retryOutcome = retryOutcome;
+      activation.working.retryContext = null;
+    }
+
     const shouldContinue =
       !goalComplete &&
       acted.result?.outcome?.success &&
@@ -1688,6 +1768,14 @@ Return JSON:
       progress,
       nextContext: shouldContinue ? acted.result.outcome : null,
     };
+
+    if (retryOutcome?.success === true && !goalComplete && shouldContinue === false) {
+      this.memory.emit('goal_resume_requested', {
+        goalId,
+        stepId: acted.decision?.nextStepId ?? null,
+        reason: 'retry_on_learn_success_needs_external_reactivation',
+      });
+    }
 
     activation.working.lastIntegration = integration;
     this._emit(activation, 'integrate', acted.result, integration, Date.now() - t0);
@@ -1918,7 +2006,7 @@ Return ONLY JSON matching this schema exactly:
     }
   }
 
-  async _processAcquisitionResult(researchResult, gap, goalContext = null, stepContext = null) {
+  async _processAcquisitionResult(activation, researchResult, gap, goalContext = null, stepContext = null) {
     try {
       if (!researchResult || researchResult.status !== 'resolved') return;
 
@@ -1949,6 +2037,7 @@ Return ONLY JSON matching this schema exactly:
           await this.memory.addSkill(skill);
           const event = createCapabilityAcquiredEvent('skill', skill, gap ?? researchResult);
           await this.memory.saveAcquisitionEvent(event);
+          await this._triggerRetryOnLearn(activation, event);
           await this.memory.recordEpisode({
             type: 'capability_acquired',
             event: 'skill',
@@ -1985,6 +2074,7 @@ Return ONLY JSON matching this schema exactly:
           await this.memory.upsertPattern(pattern);
           const event = createCapabilityAcquiredEvent('pattern', pattern, gap ?? researchResult);
           await this.memory.saveAcquisitionEvent(event);
+          await this._triggerRetryOnLearn(activation, event);
           await this.memory.recordEpisode({
             type: 'capability_acquired',
             event: 'pattern',
@@ -2051,6 +2141,7 @@ Return ONLY JSON matching this schema exactly:
           this.tools.register(tool);
           const event = createCapabilityAcquiredEvent('tool', tool, gap ?? researchResult);
           await this.memory.saveAcquisitionEvent(event);
+          await this._triggerRetryOnLearn(activation, event);
           await this.memory.recordEpisode({
             type: 'capability_acquired',
             event: 'tool',
@@ -2064,6 +2155,73 @@ Return ONLY JSON matching this schema exactly:
         gapId: gap?.id ?? researchResult?.gapId ?? null,
         error: err?.message ?? 'unknown error',
       });
+    }
+  }
+
+  async _triggerRetryOnLearn(activation, acquisitionEvent) {
+    try {
+      if (!activation?.working) return { triggered: false, reason: 'Missing activation context' };
+      const goalId = acquisitionEvent?.gapContext?.goalId ?? null;
+      const stepId = acquisitionEvent?.gapContext?.stepId ?? null;
+      const gapId = acquisitionEvent?.gapContext?.gapId ?? null;
+      if (!goalId || !stepId) return { triggered: false, reason: 'Missing goalId/stepId in acquisition event' };
+
+      const goals = await this.memory.getGoals();
+      const goal = goals.find((g) => g.id === goalId) ?? null;
+      if (!goal) return { triggered: false, reason: 'Goal not found for acquisition event' };
+
+      const gapHistory = await this.memory.getGapHistory(stepId);
+      const retryCount = this.memory.getRetryCount ? await this.memory.getRetryCount(stepId) : 0;
+      const verdict = shouldRetry({ ...acquisitionEvent, retryCount }, goal, gapHistory);
+      if (!verdict.retry) return { triggered: false, reason: verdict.reason };
+
+      const nextRetryCount = this.memory.incrementRetryCount
+        ? await this.memory.incrementRetryCount(stepId)
+        : retryCount + 1;
+
+      const step = goal.steps?.find((s) => s.id === stepId) ?? null;
+      if (step) step.status = 'pending';
+      await this.memory.upsertGoal(goal);
+      if (activation.stepCycleCounts?.delete) activation.stepCycleCounts.delete(stepId);
+
+      const targetGap = gapHistory.find((g) => g.id === gapId) ?? gapHistory[gapHistory.length - 1] ?? null;
+      const previousFailure = {
+        error: targetGap?.lastError ?? activation.working.lastResult?.outcome?.error ?? null,
+        actionType: activation.working.lastResult?.action?.type ?? null,
+      };
+      const retryContext = buildRetryContext(acquisitionEvent, targetGap, previousFailure);
+      activation.working.retryContext = {
+        ...retryContext,
+        goalId,
+        stepId,
+        gap: targetGap,
+        acquisitionEvent: { ...acquisitionEvent, retryCount: nextRetryCount },
+        retryCount: nextRetryCount,
+        maxRetries: MAX_LEARN_RETRIES,
+      };
+
+      await this.memory.recordEpisode({
+        type: 'retry_on_learn',
+        event: 'retry_queued',
+        goalId,
+        stepId,
+        data: {
+          capabilityEventId: acquisitionEvent?.id ?? null,
+          capabilityType: acquisitionEvent?.capabilityType ?? acquisitionEvent?.type ?? null,
+          capabilityId: acquisitionEvent?.capabilityId ?? null,
+          retryCount: nextRetryCount,
+          maxRetries: MAX_LEARN_RETRIES,
+          reason: verdict.reason,
+        },
+      });
+
+      return { triggered: true, reason: verdict.reason };
+    } catch (err) {
+      await this.memory.emit('warning', 'retry_on_learn_trigger_failed', {
+        acquisitionEventId: acquisitionEvent?.id ?? null,
+        error: err?.message ?? 'unknown error',
+      });
+      return { triggered: false, reason: err?.message ?? 'retry trigger failed' };
     }
   }
 
@@ -2273,6 +2431,7 @@ class InMemoryStore {
   constructor() {
     this.data = new Map();
     this.messages = new Map();
+    this.retryCounts = new Map();
   }
   async get(key) {
     const val = this.data.get(key);
@@ -2358,6 +2517,24 @@ class InMemoryStore {
     const events = (await this.get('acquisition_events')) ?? [];
     if (!goalId) return events;
     return events.filter((event) => event?.gapContext?.goalId === goalId);
+  }
+
+  async getRetryCount(stepId) {
+    if (!stepId) return 0;
+    return this.retryCounts.get(stepId) ?? 0;
+  }
+
+  async incrementRetryCount(stepId) {
+    if (!stepId) return 0;
+    const next = (this.retryCounts.get(stepId) ?? 0) + 1;
+    this.retryCounts.set(stepId, next);
+    return next;
+  }
+
+  async resetRetryCount(stepId) {
+    if (!stepId) return 0;
+    this.retryCounts.set(stepId, 0);
+    return 0;
   }
 
   // ── Episodes (atomic push + trim) ────────────────────
