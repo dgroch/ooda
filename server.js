@@ -533,6 +533,8 @@ app.get('/status', auth, asyncHandler(async (req, res) => {
       cycle: e.cycle,
       goalId: e.goalId,
       success: e.outcome?.success,
+      actionType: e.action?.type ?? null,
+      summary: e.outcome?.summary ?? null,
       timestamp: e.timestamp,
     })),
     patternsTracked: patterns.length,

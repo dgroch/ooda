@@ -1191,6 +1191,30 @@ Respond with JSON:
       return { ...reflected, decision };
     }
 
+    // ── DEFAULT TEXT EXECUTION (structural) ──
+    const needsPlainTextExecution = nextStep
+      && !nextStep.skillRequired
+      && (!(nextStep.toolsRequired?.length));
+
+    if (needsPlainTextExecution) {
+      const decision = {
+        route: 'self',
+        reasoning: 'Ready step has no explicit skill or tool requirements; execute as a default text task.',
+        action: {
+          type: 'execute_text',
+          params: {
+            goalId: goal?.id ?? null,
+            stepId: nextStep.id,
+            description: nextStep.description,
+          },
+        },
+        nextStepId: nextStep.id,
+        structuralOverride: true,
+      };
+      this._emit(activation, 'decide', { nextStep, mode: 'default_text_execution' }, decision, Date.now() - t0);
+      return { ...reflected, decision };
+    }
+
     // ── DELEGATION CHECK (structural) ──
     const delegationTarget = this._checkDelegation(nextStep, reflected.team);
 
@@ -1299,6 +1323,39 @@ Decide HOW to execute. Respond with JSON:
             memory: this.memory,
             reason: this.reason,
           });
+          break;
+        }
+        case 'execute_text': {
+          const params = action.params ?? {};
+          const completion = await this.reason(
+            this._buildPrompt(activation, 'execute_text', {
+              identity: this.identity,
+              goal: decided.resolvedGoal ? {
+                id: decided.resolvedGoal.id,
+                description: decided.resolvedGoal.description,
+              } : null,
+              step: {
+                id: params.stepId ?? decided.decision?.nextStepId ?? null,
+                description: params.description ?? 'Complete the next step',
+              },
+              instructions: `You are executing a single concrete work step.
+Return JSON:
+{
+  "summary": "What was accomplished in one paragraph",
+  "artifact": "The concrete output/result of the step",
+  "confidence": 0.0-1.0,
+  "notes": ["optional note"]
+}`,
+            }),
+          );
+          outcome = {
+            success: true,
+            type: 'text_execution',
+            summary: completion.summary ?? '',
+            artifact: completion.artifact ?? '',
+            confidence: completion.confidence ?? 0.5,
+            notes: completion.notes ?? [],
+          };
           break;
         }
         case 'use_tool': {
