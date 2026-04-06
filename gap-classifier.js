@@ -96,8 +96,8 @@ function createGapEvent(classification = {}, context = {}) {
 
   return {
     id: context.id ?? `gap_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-    goalId: context.goalId ?? null,
-    stepId: context.stepId ?? null,
+    goalId: String(context.goalId ?? 'unknown_goal'),
+    stepId: String(context.stepId ?? 'unknown_step'),
     gapType: safeType,
     description: context.description ?? classification.reason ?? 'Capability gap detected',
     confidence: Number.isFinite(classification.confidence) ? classification.confidence : 0.5,

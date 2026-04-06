@@ -1813,6 +1813,7 @@ Return JSON: { "summarised": [{ "id": "...", "text": "...", "tokens": N }] }`,
         { ...context, detectedBy },
       );
       if (this.memory.saveGap) await this.memory.saveGap(fallback);
+      if (this.memory.emit) await this.memory.emit('warning', 'gap_detected', fallback);
       activation.working.lastGap = fallback;
       return fallback;
     }
