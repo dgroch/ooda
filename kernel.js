@@ -19,6 +19,15 @@ import {
   validateResearchResult,
   shouldTriggerResearch,
 } from './research-contract.js';
+import { CircuitBreaker } from './circuit-breaker.js';
+import {
+  createCapabilityAcquiredEvent,
+  executeAcquiredSkill,
+  sandboxTest,
+  validateProposedPattern,
+  validateProposedSkill,
+  validateProposedTool,
+} from './acquisition.js';
 
 function parseLlmJson(raw) {
   if (raw && typeof raw === 'object') return raw;
@@ -34,48 +43,6 @@ function parseLlmJson(raw) {
       try { return JSON.parse(text.slice(start)); } catch { /* noop */ }
     }
     return null;
-  }
-}
-
-// ─────────────────────────────────────────────
-// 0. CIRCUIT BREAKER
-//    Tracks consecutive LLM failures; halts reasoning when open.
-// ─────────────────────────────────────────────
-
-class CircuitBreaker {
-  /**
-   * @param {number} [failureThreshold=5] - Number of failures before opening
-   * @param {number} [resetWindowMs=60000] - Window in ms to count failures
-   */
-  constructor(failureThreshold = 5, resetWindowMs = 60000) {
-    this.failureThreshold = failureThreshold;
-    this.resetWindowMs = resetWindowMs;
-    this.failures = [];
-  }
-
-  /** Record a failed reason() call. */
-  recordFailure() {
-    this.failures.push(Date.now());
-    this.failures = this.failures.filter((t) => Date.now() - t < this.resetWindowMs);
-  }
-
-  /** Record a successful reason() call — resets failure count. */
-  recordSuccess() {
-    this.failures = [];
-  }
-
-  /** True if the circuit is open (too many recent failures). */
-  isOpen() {
-    return this.failures.length >= this.failureThreshold;
-  }
-
-  /** Returns current circuit status. */
-  getStatus() {
-    return {
-      closed: !this.isOpen(),
-      failures: this.failures.length,
-      lastFailure: this.failures[this.failures.length - 1] ?? null,
-    };
   }
 }
 
@@ -673,6 +640,16 @@ class MemoryManager {
     if (!this.store.getResearchHistory) return [];
     return this.store.getResearchHistory(gapId);
   }
+
+  async saveAcquisitionEvent(event) {
+    if (!this.store.saveAcquisitionEvent) return null;
+    return this.store.saveAcquisitionEvent(event);
+  }
+
+  async getAcquisitionHistory(goalId) {
+    if (!this.store.getAcquisitionHistory) return [];
+    return this.store.getAcquisitionHistory(goalId);
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -821,13 +798,17 @@ class ActionValidator {
 class AgentKernel {
   constructor(config) {
     // Circuit breaker wraps the raw reason() LLM function
-    this._circuitBreaker = new CircuitBreaker(
-      config.circuitBreakerThreshold ?? 5,
-      config.circuitBreakerWindowMs ?? 60000,
-    );
+    this.circuitBreaker = new CircuitBreaker({
+      failureThreshold: config.circuitBreakerThreshold,
+      halfOpenMs: config.circuitBreakerWindowMs,
+      resetOnSuccess: config.circuitResetOnSuccess,
+    });
+    // Backward compatibility for existing tests/integrations.
+    this._circuitBreaker = this.circuitBreaker;
+    this._halfOpenProbeRemaining = 0;
     const originalReason = config.reason;
     this.reason = async (prompt) => {
-      if (this._circuitBreaker.isOpen()) {
+      if (this.circuitBreaker.isOpen()) {
         return {
           situationAssessment: 'circuit_open',
           goalId: null,
@@ -838,12 +819,29 @@ class AgentKernel {
           _circuitOpen: true,
         };
       }
+
+      if (this.circuitBreaker.isHalfOpen() && this._halfOpenProbeRemaining <= 0) {
+        return {
+          situationAssessment: 'circuit_open',
+          goalId: null,
+          confidence: 0,
+          answers: [],
+          revisedConfidence: 0,
+          insights: [],
+          _circuitOpen: true,
+        };
+      }
+
+      if (this.circuitBreaker.isHalfOpen() && this._halfOpenProbeRemaining > 0) {
+        this._halfOpenProbeRemaining -= 1;
+      }
+
       try {
         const result = await originalReason(prompt);
-        this._circuitBreaker.recordSuccess();
+        this.circuitBreaker.recordSuccess();
         return result;
       } catch (err) {
-        this._circuitBreaker.recordFailure();
+        this.circuitBreaker.recordFailure(err?.message ?? 'LLM call failed');
         throw err;
       }
     };
@@ -893,7 +891,7 @@ class AgentKernel {
 
   /** Returns current circuit breaker status. */
   getCircuitStatus() {
-    return this._circuitBreaker.getStatus();
+    return this.circuitBreaker.getState();
   }
 
   _recordMetrics(result, totalDurationMs) {
@@ -944,7 +942,7 @@ class AgentKernel {
     if (activation.cycleCount > this.maxCycles) {
       return { status: 'halted', reason: 'max_cycles_exceeded', cycles: activation.cycleCount };
     }
-    if (this._circuitBreaker.isOpen()) {
+    if (this.circuitBreaker.isOpen()) {
       const goals = await this.memory.getGoals();
       const activeGoal = goals
         .filter((g) => g.status === 'active' || g.status === 'pending')
@@ -955,17 +953,22 @@ class AgentKernel {
         stepId: step?.id ?? trigger?.payload?.stepId ?? null,
         stepDescription: step?.description ?? trigger?.payload?.description ?? 'LLM circuit breaker is open',
         toolsRequired: step?.toolsRequired ?? [],
-        description: 'LLM circuit breaker open; execution paused until retry window',
-        reason: 'LLM circuit breaker open',
+        description: 'LLM circuit breaker is open',
+        reason: 'LLM circuit breaker is open',
       }, 'tool');
       return {
         status: 'paused',
         reason: 'llm_circuit_open',
-        circuitState: this.getCircuitStatus(),
+        circuitState: this.circuitBreaker.getState(),
         goalId: activeGoal?.id ?? trigger?.payload?.goalId ?? null,
         willRetryAutomatically: true,
         cycles: activation.cycleCount,
       };
+    }
+    if (this.circuitBreaker.isHalfOpen()) {
+      this._halfOpenProbeRemaining = 1;
+    } else {
+      this._halfOpenProbeRemaining = 0;
     }
 
     const observed  = await this._observe(activation, trigger);
@@ -1421,12 +1424,26 @@ Decide HOW to execute. Respond with JSON:
             outcome = { success: false, error: `Skill not found: ${action.skillId}`, needsResearch: true };
             break;
           }
-          outcome = await skill.execute({
-            params: action.params ?? {},
-            tools: this.tools,
-            memory: this.memory,
-            reason: this.reason,
-          });
+          if (skill.source === 'self-acquired') {
+            const acquired = await executeAcquiredSkill(skill, {
+              params: action.params ?? {},
+              goal: decided.resolvedGoal ?? null,
+              step: resolvedStep ?? null,
+              reason: this.reason,
+            });
+            outcome = {
+              success: true,
+              type: 'self_acquired_skill_execution',
+              ...acquired,
+            };
+          } else {
+            outcome = await skill.execute({
+              params: action.params ?? {},
+              tools: this.tools,
+              memory: this.memory,
+              reason: this.reason,
+            });
+          }
           break;
         }
         case 'execute_text': {
@@ -1469,6 +1486,9 @@ Return JSON:
         }
         case 'research': {
           outcome = await this._research(activation, decided.decision.gapEvent, decided.resolvedGoal, resolvedStep);
+          if (outcome?.status === 'resolved') {
+            await this._processAcquisitionResult(outcome, decided.decision.gapEvent, decided.resolvedGoal, resolvedStep);
+          }
           if (!outcome.success) activation.working.researchFailed = true;
           break;
         }
@@ -1866,14 +1886,6 @@ Return ONLY JSON matching this schema exactly:
           });
         }
 
-        if (normalized.proposedPattern) {
-          await this.memory.upsertPattern(normalized.proposedPattern);
-        }
-
-        if (normalized.proposedSkill) {
-          await this.memory.addSkill(normalized.proposedSkill);
-        }
-
         return {
           success: normalized.status !== 'failed',
           type: 'research',
@@ -1918,6 +1930,155 @@ Return ONLY JSON matching this schema exactly:
         requiresHumanApproval: false,
         attempts: 0,
       };
+    }
+  }
+
+  async _processAcquisitionResult(researchResult, gap, goalContext = null, stepContext = null) {
+    try {
+      if (!researchResult || researchResult.status !== 'resolved') return;
+
+      const coProposedToolIds = researchResult.proposedTool?.id ? [researchResult.proposedTool.id] : [];
+      const skillValidation = researchResult.proposedSkill
+        ? validateProposedSkill(researchResult.proposedSkill, {
+          has: (id) => this.skills.has(id),
+          hasTool: (id) => this.tools.has(id),
+          coProposedToolIds,
+        })
+        : null;
+
+      if (researchResult.proposedSkill && skillValidation?.valid) {
+        const simulation = await sandboxTest(
+          researchResult.proposedSkill,
+          goalContext ?? {},
+          stepContext ?? {},
+          this.reason,
+        );
+        if (simulation.passed) {
+          const skill = {
+            ...researchResult.proposedSkill,
+            source: 'self-acquired',
+            acquiredFromGapId: gap?.id ?? researchResult.gapId ?? null,
+            acquiredAt: new Date().toISOString(),
+          };
+          this.skills.register(skill);
+          await this.memory.addSkill(skill);
+          const event = createCapabilityAcquiredEvent('skill', skill, gap ?? researchResult);
+          await this.memory.saveAcquisitionEvent(event);
+          await this.memory.recordEpisode({
+            type: 'capability_acquired',
+            event: 'skill',
+            data: event,
+            goalId: goalContext?.id ?? gap?.goalId ?? null,
+          });
+        } else {
+          await this.memory.emit('warning', 'acquisition_rejected', {
+            capabilityType: 'skill',
+            capabilityId: researchResult.proposedSkill.id,
+            reason: simulation.reason ?? 'sandbox test failed',
+          });
+        }
+      } else if (researchResult.proposedSkill) {
+        await this.memory.emit('warning', 'acquisition_rejected', {
+          capabilityType: 'skill',
+          capabilityId: researchResult.proposedSkill.id ?? null,
+          errors: skillValidation?.errors ?? ['invalid proposed skill'],
+        });
+      }
+
+      if (researchResult.proposedPattern) {
+        const existingPatterns = await this.memory.getPatterns();
+        const patternValidation = validateProposedPattern(researchResult.proposedPattern, {
+          has: (id) => existingPatterns.some((p) => p.id === id),
+        });
+        if (patternValidation.valid) {
+          const pattern = {
+            ...researchResult.proposedPattern,
+            source: 'self-acquired',
+            acquiredFromGapId: gap?.id ?? researchResult.gapId ?? null,
+            acquiredAt: new Date().toISOString(),
+          };
+          await this.memory.upsertPattern(pattern);
+          const event = createCapabilityAcquiredEvent('pattern', pattern, gap ?? researchResult);
+          await this.memory.saveAcquisitionEvent(event);
+          await this.memory.recordEpisode({
+            type: 'capability_acquired',
+            event: 'pattern',
+            data: event,
+            goalId: goalContext?.id ?? gap?.goalId ?? null,
+          });
+        } else {
+          await this.memory.emit('warning', 'acquisition_rejected', {
+            capabilityType: 'pattern',
+            capabilityId: researchResult.proposedPattern.id ?? null,
+            errors: patternValidation.errors,
+          });
+        }
+      }
+
+      if (researchResult.proposedTool) {
+        const toolValidation = validateProposedTool(researchResult.proposedTool, {
+          has: (id) => this.tools.has(id),
+        });
+        if (!toolValidation.valid) {
+          await this.memory.emit('warning', 'acquisition_rejected', {
+            capabilityType: 'tool',
+            capabilityId: researchResult.proposedTool.id ?? null,
+            errors: toolValidation.errors,
+          });
+          return;
+        }
+
+        if (toolValidation.requiresApproval) {
+          const team = await this.memory.getTeamRoster();
+          const humanId = team.find((m) => m.role === 'human')?.id ?? 'human';
+          const approvalMessage = {
+            id: `msg_tool_approval_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            from: this.identity?.name ?? 'kernel',
+            to: humanId,
+            goalId: goalContext?.id ?? gap?.goalId ?? null,
+            stepId: stepContext?.id ?? gap?.stepId ?? null,
+            content: `Approval required to install proposed tool "${researchResult.proposedTool.id}".`,
+            metadata: {
+              type: 'tool_install_approval',
+              proposedTool: researchResult.proposedTool,
+              gapId: gap?.id ?? researchResult.gapId ?? null,
+            },
+          };
+          await this.memory.saveMessage(approvalMessage);
+          await this.memory.emit('warning', 'acquisition_requires_approval', {
+            capabilityType: 'tool',
+            capabilityId: researchResult.proposedTool.id,
+            messageId: approvalMessage.id,
+          });
+        } else {
+          const tool = {
+            ...researchResult.proposedTool,
+            source: 'self-acquired',
+            acquiredFromGapId: gap?.id ?? researchResult.gapId ?? null,
+            acquiredAt: new Date().toISOString(),
+            execute: async () => ({
+              success: false,
+              requiresImplementation: true,
+              executeTemplate: researchResult.proposedTool.executeTemplate,
+              message: 'Self-acquired tool registered from template; concrete execution binding is required.',
+            }),
+          };
+          this.tools.register(tool);
+          const event = createCapabilityAcquiredEvent('tool', tool, gap ?? researchResult);
+          await this.memory.saveAcquisitionEvent(event);
+          await this.memory.recordEpisode({
+            type: 'capability_acquired',
+            event: 'tool',
+            data: event,
+            goalId: goalContext?.id ?? gap?.goalId ?? null,
+          });
+        }
+      }
+    } catch (err) {
+      await this.memory.emit('warning', 'acquisition_processing_failed', {
+        gapId: gap?.id ?? researchResult?.gapId ?? null,
+        error: err?.message ?? 'unknown error',
+      });
     }
   }
 
@@ -2199,6 +2360,19 @@ class InMemoryStore {
     if (!gapId) return [];
     const results = (await this.get('research_results')) ?? [];
     return results.filter((r) => r.gapId === gapId);
+  }
+
+  async saveAcquisitionEvent(event) {
+    const events = (await this.get('acquisition_events')) ?? [];
+    events.push(JSON.parse(JSON.stringify(event)));
+    await this.set('acquisition_events', events);
+    return event;
+  }
+
+  async getAcquisitionHistory(goalId) {
+    const events = (await this.get('acquisition_events')) ?? [];
+    if (!goalId) return events;
+    return events.filter((event) => event?.gapContext?.goalId === goalId);
   }
 
   // ── Episodes (atomic push + trim) ────────────────────
