@@ -1116,52 +1116,6 @@ Respond with JSON:
       activation.stepCycleCounts.set(nextStep.id, count);
     }
 
-    // ── STRUCTURAL ESCALATION (before LLM) ──
-    const escalationVerdict = this.escalation.evaluate({
-      confidence,
-      actionType: nextStep?.skillRequired,
-      hasRequiredSkill,
-      researchFailed: activation.working.researchFailed === true,
-      blockedSteps,
-      totalSteps: goal?.steps?.length ?? 0,
-      doneSteps: (goal?.steps ?? []).filter((s) => s.status === 'done').length,
-      cyclesOnCurrentStep: nextStep ? (activation.stepCycleCounts.get(nextStep.id) ?? 0) : 0,
-      team: reflected.team,
-    });
-
-    if (escalationVerdict.mustEscalate) {
-      this._metrics.totalEscalations++;
-      const msgId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      const pendingMessage = {
-        id: msgId,
-        from: this.identity.name,
-        to: escalationVerdict.suggestedTarget,
-        content: `I need help. ${escalationVerdict.reason}`,
-        goalId: goal?.id ?? null,
-        stepId: nextStep?.id ?? null,
-        status: 'pending',
-        metadata: {
-          reason: escalationVerdict.reason,
-          confidence,
-          cyclesOnCurrentStep: nextStep ? (activation.stepCycleCounts.get(nextStep.id) ?? 0) : 0,
-        },
-      };
-      // Persist the pending message so a human can respond and resume this goal
-      await this.memory.saveMessage(pendingMessage);
-      const decision = {
-        route: 'escalate',
-        reasoning: escalationVerdict.reason,
-        action: {
-          type: 'communicate',
-          message: pendingMessage,
-        },
-        nextStepId: nextStep?.id,
-        structuralOverride: true,
-      };
-      this._emit(activation, 'decide', { escalationVerdict }, decision, Date.now() - t0);
-      return { ...reflected, decision };
-    }
-
     // ── NO READY STEPS ──
     if (!nextStep) {
       const decision = {
@@ -1212,6 +1166,51 @@ Respond with JSON:
         structuralOverride: true,
       };
       this._emit(activation, 'decide', { nextStep, mode: 'default_text_execution' }, decision, Date.now() - t0);
+      return { ...reflected, decision };
+    }
+
+    // ── STRUCTURAL ESCALATION (before LLM, but after default text execution) ──
+    const escalationVerdict = this.escalation.evaluate({
+      confidence,
+      actionType: nextStep?.skillRequired,
+      hasRequiredSkill,
+      researchFailed: activation.working.researchFailed === true,
+      blockedSteps,
+      totalSteps: goal?.steps?.length ?? 0,
+      doneSteps: (goal?.steps ?? []).filter((s) => s.status === 'done').length,
+      cyclesOnCurrentStep: nextStep ? (activation.stepCycleCounts.get(nextStep.id) ?? 0) : 0,
+      team: reflected.team,
+    });
+
+    if (escalationVerdict.mustEscalate) {
+      this._metrics.totalEscalations++;
+      const msgId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const pendingMessage = {
+        id: msgId,
+        from: this.identity.name,
+        to: escalationVerdict.suggestedTarget,
+        content: `I need help. ${escalationVerdict.reason}`,
+        goalId: goal?.id ?? null,
+        stepId: nextStep?.id ?? null,
+        status: 'pending',
+        metadata: {
+          reason: escalationVerdict.reason,
+          confidence,
+          cyclesOnCurrentStep: nextStep ? (activation.stepCycleCounts.get(nextStep.id) ?? 0) : 0,
+        },
+      };
+      await this.memory.saveMessage(pendingMessage);
+      const decision = {
+        route: 'escalate',
+        reasoning: escalationVerdict.reason,
+        action: {
+          type: 'communicate',
+          message: pendingMessage,
+        },
+        nextStepId: nextStep?.id,
+        structuralOverride: true,
+      };
+      this._emit(activation, 'decide', { escalationVerdict }, decision, Date.now() - t0);
       return { ...reflected, decision };
     }
 
