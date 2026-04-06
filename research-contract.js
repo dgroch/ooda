@@ -107,7 +107,10 @@ function validateResearchResult(result) {
   }
 
   ensureString(errors, result.gapId, 'gapId');
-  ensureString(errors, result.gapType, 'gapType');
+  const validGapTypes = ['knowledge', 'procedural', 'tool', 'authority', 'ambiguity'];
+  if (!validGapTypes.includes(result.gapType)) {
+    errors.push(`gapType must be one of: ${validGapTypes.join(', ')}`);
+  }
   if (!['resolved', 'partial', 'failed'].includes(result.status)) {
     errors.push(`status must be one of: resolved, partial, failed`);
   }

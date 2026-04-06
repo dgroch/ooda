@@ -1902,6 +1902,7 @@ Return ONLY JSON matching this schema exactly:
       await this.memory.emit('warning', 'research_failed', failure);
       return failure;
     } catch (err) {
+      await this.memory.emit('warning', 'research_failed', { gapId: gap?.id, error: err.message, source: 'outer_catch' });
       return {
         success: false,
         type: 'research',
