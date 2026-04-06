@@ -179,9 +179,8 @@ function parseLlmJson(raw) {
   text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
   // Remove trailing commas before closing braces/brackets
   text = text.replace(/,(\s*[}\]])/g, '$1');
-  // Replace single-quoted strings with double-quoted (simple cases only)
-  // Only replace when inside JSON values, not when part of a contraction
-  text = text.replace(/'/g, '"');
+  // NOTE: Do NOT replace apostrophes globally — it corrupts valid JSON
+  // strings containing contractions (e.g. "don't", "breaker's").
   try {
     return JSON.parse(text);
   } catch {

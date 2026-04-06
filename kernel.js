@@ -40,7 +40,7 @@ function parseLlmJson(raw) {
   let text = typeof raw === 'string' ? raw : String(raw ?? '');
   text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
   text = text.replace(/,(\s*[}\]])/g, '$1');
-  text = text.replace(/'/g, '"');
+  // NOTE: Do NOT replace apostrophes globally — corrupts valid JSON strings
   try {
     return JSON.parse(text);
   } catch {
