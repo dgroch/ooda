@@ -109,7 +109,8 @@ export class TrelloSyncAdapter {
   }
 
   async _updateCheckItem(cardId, checkItemId, state) {
-    return this._trelloFetch(`/cards/${cardId}/checkItems/${checkItemId}`, {
+    // Correct Trello endpoint: /cards/{cardId}/checkItem/{checkItemId} (singular)
+    return this._trelloFetch(`/cards/${cardId}/checkItem/${checkItemId}`, {
       method: 'PUT',
       body: JSON.stringify({ state }),
     });
