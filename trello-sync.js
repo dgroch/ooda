@@ -1,24 +1,19 @@
 /**
- * Trello Sync Adapter
+ * Trello Sync Adapter v2
  *
- * Bidirectional sync between OODA kernel (SQLite) and Trello board.
+ * Full bidirectional sync with workflow:
+ * - Draft -> Goals: triggers OODA activation
+ * - Goals -> Doing: when kernel starts processing
+ * - Kernel events: verbose comments on card
+ * - Escalations: move to Escalations + @mention
+ * - Complete: move to Done
  *
- * Mapping:
- *   - Goal → Card on "Goals" list (or list named after goal priority)
- *   - Step → Checklist item on goal card
- *   - Step status → checklist item checked/unchecked
- *   - Gap/Research → Card comment
- *   - Escalation → Card label + comment
- *
- * Environment:
- *   TRELLO_API_KEY, TRELLO_TOKEN, TRELLO_BOARD_ID
- *   Or: pass as constructor options
+ * Lists: Draft, Goals, Doing, Escalations, Done
  */
 
 const TRELLO_BASE = 'https://api.trello.com/1';
 
 async function trelloFetch(path, options = {}) {
-  // Inject key/token as query params (Trello personal token auth)
   const sep = path.includes('?') ? '&' : '?';
   const authPath = `${path}${sep}key=${this?.apiKey}&token=${this?.token}`;
   const url = `${TRELLO_BASE}${authPath}`;
@@ -40,12 +35,13 @@ export class TrelloSyncAdapter {
     this.apiKey = options.apiKey ?? process.env.TRELLO_API_KEY;
     this.token = options.token ?? process.env.TRELLO_TOKEN;
     this.boardId = options.boardId ?? process.env.TRELLO_BOARD_ID;
-    this.listNameGoals = options.listNameGoals ?? 'Goals';
-    this.listNameDone = options.listNameDone ?? 'Done';
     this.syncIntervalMs = options.syncIntervalMs ?? 30000;
     this._running = false;
     this._intervalId = null;
     this._trelloFetch = trelloFetch.bind({ apiKey: this.apiKey, token: this.token });
+
+    // Store reference to server's fetch for triggering goals
+    this._triggerGoalApi = options.triggerGoalApi ?? null;
 
     if (!this.apiKey || !this.token || !this.boardId) {
       console.warn('[trello-sync] Missing TRELLO_API_KEY, TRELLO_TOKEN, or TRELLO_BOARD_ID — adapter disabled');
@@ -53,36 +49,27 @@ export class TrelloSyncAdapter {
     }
   }
 
-  async _getLists() {
+  async _init() {
     const lists = await this._trelloFetch(`/boards/${this.boardId}/lists?fields=id,name`);
-    return lists;
-  }
-
-  async _getOrCreateList(name) {
-    console.log(`[trello-sync] _getOrCreateList: ${name}`);
-    const lists = await this._getLists();
-    console.log(`[trello-sync] Found lists:`, lists.map(l => l.name));
-    let list = lists.find((l) => l.name === name);
-    if (!list) {
-      console.log(`[trello-sync] Creating list: ${name}`);
-      list = await this._trelloFetch(`/boards/${this.boardId}/lists`, {
-        method: 'POST',
-        body: JSON.stringify({ name, pos: 'bottom' }),
-      });
-      console.log(`[trello-sync] Created list:`, list);
-    }
-    return list;
+    this.listIds = {
+      draft: lists.find(l => l.name === 'Draft')?.id,
+      goals: lists.find(l => l.name === 'Goals')?.id,
+      doing: lists.find(l => l.name === 'Doing')?.id,
+      escalations: lists.find(l => l.name === 'Escalations')?.id,
+      done: lists.find(l => l.name === 'Done')?.id,
+    };
+    console.log('[trello-sync] Lists:', this.listIds);
+    // Get member ID for mentions
+    const members = await this._trelloFetch(`/boards/${this.boardId}/members?fields=id,username`);
+    this.danMember = members.find(m => m.username === 'danielgroch');
+    console.log('[trello-sync] Dan member:', this.danMember);
   }
 
   async _getCards(listId) {
-    const path = `/lists/${listId}/cards?fields=id,name,desc,idList,labels`;
-    console.log(`[trello-sync] _getCards: listId=${listId}, path=${path}`);
-    console.log(`[trello-sync] _getCards: boardId=${this.boardId}, apiKey=${this.apiKey?.slice(0,8)}`);
-    return this._trelloFetch(path);
+    return this._trelloFetch(`/lists/${listId}/cards?fields=id,name,desc,idList,checklists`);
   }
 
   async _createCard(listId, name, desc = '') {
-    console.log(`[trello-sync] _createCard: listId=${listId}, name=${name}`);
     return this._trelloFetch(`/cards`, {
       method: 'POST',
       body: JSON.stringify({ idList: listId, name, desc }),
@@ -124,231 +111,220 @@ export class TrelloSyncAdapter {
   async _updateCheckItem(cardId, checkItemId, state) {
     return this._trelloFetch(`/cards/${cardId}/checkItems/${checkItemId}`, {
       method: 'PUT',
-      body: JSON.stringify({ state }), // 'complete' or 'incomplete'
+      body: JSON.stringify({ state }),
     });
   }
 
   // ─────────────────────────────────────────────────
-  // Sync: OODA → Trello
+  // Sync: Trello → OODA (trigger new goals from Draft→Goals)
   // ─────────────────────────────────────────────────
 
-  /**
-   * Sync all goals from the store to Trello.
-   * @param {Object} store - SqliteStore or InMemoryStore
-   */
-  async syncGoalsToTrello(store) {
-    if (this.disabled) return;
+  async syncTrelloToOODA(store) {
+    if (this.disabled || !this.listIds.goals) return [];
 
-    const goalsList = await this._getOrCreateList(this.listNameGoals);
-    const doneList = await this._getOrCreateList(this.listNameDone);
+    const goalsListCards = await this._getCards(this.listIds.goals);
+    const draftListCards = await this._getCards(this.listIds.draft);
 
-    const goals = await store.listGoals();
-    const existingCards = await this._getCards(goalsList.id);
-    const existingCardByGoalId = new Map();
-    for (const card of existingCards) {
-      // Extract goal ID from card description (stored as JSON)
+    const triggeredGoals = [];
+
+    // Check Draft list for cards moved to Goals (simulated: check Draft for unprocessed cards)
+    // For now: check Goals list for cards without OODA metadata that need activation
+    for (const card of goalsListCards) {
+      let meta = {};
       try {
-        const desc = JSON.parse(card.desc);
-        if (desc.goalId) existingCardByGoalId.set(desc.goalId, card);
+        meta = card.desc ? JSON.parse(card.desc) : {};
       } catch {
-        // Not a goal card
-      }
-    }
-
-    for (const row of goals) {
-      const goal = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
-      if (!goal) continue;
-
-      let card = existingCardByGoalId.get(goal.id);
-      const goalData = JSON.stringify({ goalId: goal.id, status: goal.status, progress: 0 });
-      const cardName = `${goal.description?.slice(0, 60) ?? 'Untitled Goal'}`;
-
-      if (!card) {
-        // Create new card
-        card = await this._createCard(goalsList.id, cardName, goalData);
-      } else if (card.name !== cardName) {
-        // Update card name if changed
-        await this._updateCard(card.id, { name: cardName, desc: goalData });
+        // No valid JSON in desc, treat as new
       }
 
-      // Move to Done list if goal is complete
-      if (goal.status === 'done' && card.idList !== doneList.id) {
-        await this._updateCard(card.id, { idList: doneList.id });
-      } else if (goal.status !== 'done' && card.idList !== goalsList.id) {
-        await this._updateCard(card.id, { idList: goalsList.id });
-      }
+      // If no OODA metadata, this is a new goal to trigger
+      if (!meta.oodaManaged) {
+        console.log(`[trello-sync] NEW GOAL from Trello: "${card.name}"`);
 
-      // Sync steps as checklist items
-      await this._syncStepsToCard(card.id, goal);
-    }
-  }
-
-  async _syncStepsToCard(cardId, goal) {
-    const checklists = await this._getChecklists(cardId);
-    let stepsChecklist = checklists.find((c) => c.name === 'Steps');
-
-    if (!goal.steps || goal.steps.length === 0) return;
-
-    if (!stepsChecklist) {
-      stepsChecklist = await this._addChecklist(cardId, 'Steps');
-    }
-
-    // Get existing check items
-    const existingItems = new Map();
-    for (const item of stepsChecklist.checkItems) {
-      existingItems.set(item.name, item);
-    }
-
-    // Upsert steps
-    for (const step of goal.steps) {
-      const itemName = step.description?.slice(0, 100) ?? step.id;
-      const item = existingItems.get(itemName);
-
-      if (!item) {
-        // Create new check item
-        await this._addCheckItem(stepsChecklist.id, itemName);
-      } else {
-        // Update state if changed
-        const expectedState = step.status === 'done' ? 'complete' : 'incomplete';
-        if (item.state !== expectedState) {
-          await this._updateCheckItem(cardId, item.id, expectedState);
-        }
-      }
-    }
-  }
-
-  /**
-   * Post a gap detection or research result as a comment.
-   */
-  async postGapComment(store, gap) {
-    if (this.disabled) return;
-
-    // Find the goal card
-    const goalsList = await this._getOrCreateList(this.listNameGoals);
-    const cards = await this._getCards(goalsList.id);
-
-    const goalCard = cards.find((c) => {
-      try {
-        const desc = JSON.parse(c.desc);
-        return desc.goalId === gap.goalId;
-      } catch {
-        return false;
-      }
-    });
-
-    if (!goalCard) return;
-
-    const comment = `[GAP] ${gap.gapType}: ${gap.description?.slice(0, 100) ?? 'Unknown gap'}`;
-    await this._addComment(goalCard.id, comment);
-  }
-
-  /**
-   * Post an escalation as a labeled comment.
-   */
-  async postEscalationComment(store, message) {
-    if (this.disabled) return;
-
-    // Find the goal card
-    const goalsList = await this._getOrCreateList(this.listNameGoals);
-    const cards = await this._getCards(goalsList.id);
-
-    const goalCard = cards.find((c) => {
-      try {
-        const desc = JSON.parse(c.desc);
-        return desc.goalId === message.goalId;
-      } catch {
-        return false;
-      }
-    });
-
-    if (!goalCard) return;
-
-    const comment = `[ESCALATE] ${message.content?.slice(0, 200) ?? 'Escalation'}`;
-    await this._addComment(goalCard.id, comment);
-  }
-
-  // ─────────────────────────────────────────────────
-  // Sync: Trello → OODA (human moves card)
-  // ─────────────────────────────────────────────────
-
-  /**
-   * Pull changes from Trello: check for manual card moves or check item toggles.
-   * Returns updates to apply to the store.
-   */
-  async syncFromTrello(store) {
-    if (this.disabled) return { goals: [], steps: [] };
-
-    const updates = { goals: [], steps: [] };
-    const goalsList = await this._getOrCreateList(this.listNameGoals);
-    const cards = await this._getCards(goalsList.id);
-
-    for (const card of cards) {
-      try {
-        const meta = JSON.parse(card.desc);
-        if (!meta.goalId) continue;
-
-        const goals = await store.listGoals();
-        const goalRow = goals.find((g) => g.id === meta.goalId);
-        if (!goalRow) continue;
-
-        const goal = typeof goalRow.data === 'string' ? JSON.parse(goalRow.data) : goalRow.data;
-
-        // Check if manually moved to Done
-        if (card.idList === 'done' && goal.status !== 'done') {
-          updates.goals.push({ id: goal.id, status: 'done' });
-        }
-
-        // Check step completion from checklist
+        // Extract steps from checklist "Steps"
         const checklists = await this._getChecklists(card.id);
-        const stepsChecklist = checklists.find((c) => c.name === 'Steps');
-        if (stepsChecklist && goal.steps) {
-          for (const item of stepsChecklist.checkItems) {
-            const step = goal.steps.find((s) => (s.description?.slice(0, 100) ?? s.id) === item.name);
-            if (step) {
-              const expectedStatus = item.state === 'complete' ? 'done' : 'pending';
-              if (step.status !== expectedStatus) {
-                updates.steps.push({ goalId: goal.id, stepId: step.id, status: expectedStatus });
-              }
+        const stepsChecklist = checklists.find(c => c.name === 'Steps');
+        const steps = stepsChecklist?.checkItems?.map((item, idx) => ({
+          id: `step_${idx + 1}`,
+          description: item.name,
+          status: 'pending',
+        })) ?? [];
+
+        // Trigger OODA via API
+        if (this._triggerGoalApi) {
+          try {
+            await this._triggerGoalApi({
+              id: `trello_${card.id.slice(0, 8)}`,
+              description: card.name,
+              steps,
+            });
+            await this._addComment(card.id, `[🤖 OODA] Goal activated with ${steps.length} steps`);
+
+            // Mark as OODA managed
+            meta = { oodaManaged: true, goalId: card.id, steps: steps.map(s => s.id) };
+            await this._updateCard(card.id, { desc: JSON.stringify(meta) });
+
+            // Move to Doing
+            if (this.listIds.doing) {
+              await this._updateCard(card.id, { idList: this.listIds.doing });
+              await this._addComment(card.id, `[🤖 OODA] Processing... moved to Doing`);
+            }
+
+            triggeredGoals.push({ cardId: card.id, goalId: meta.goalId, steps });
+          } catch (err) {
+            console.error('[trello-sync] Failed to trigger goal:', err.message);
+            await this._addComment(card.id, `[❌ OODA] Failed to activate: ${err.message}`);
+          }
+        }
+      }
+    }
+
+    return triggeredGoals;
+  }
+
+  // ─────────────────────────────────────────────────
+  // Sync: OODA → Trello (update existing goals)
+  // ─────────────────────────────────────────────────
+
+  async syncOODAToTrello(store, kernelEvents = []) {
+    if (this.disabled || !this.listIds.goals) return;
+
+    const allListIds = [this.listIds.goals, this.listIds.doing, this.listIds.escalations];
+    const allCards = [];
+    for (const lid of allListIds) {
+      if (lid) allCards.push(...await this._getCards(lid));
+    }
+
+    // Get all goals from OODA
+    const oodaGoals = await store.listGoals();
+
+    for (const card of allCards) {
+      let meta = {};
+      try {
+        meta = card.desc ? JSON.parse(card.desc) : {};
+      } catch {
+        continue;
+      }
+
+      if (!meta.oodaManaged) continue;
+
+      // Find corresponding OODA goal
+      const oodaGoal = oodaGoals.find(g => {
+        const gData = typeof g.data === 'string' ? JSON.parse(g.data) : g.data;
+        return gData?.id === meta.goalId;
+      });
+
+      if (!oodaGoal) continue;
+
+      const goal = typeof oodaGoal.data === 'string' ? JSON.parse(oodaGoal.data) : oodaGoal.data;
+
+      // Sync step checklist
+      const checklists = await this._getChecklists(card.id);
+      let stepsChecklist = checklists.find(c => c.name === 'Steps');
+
+      if (goal.steps?.length && !stepsChecklist) {
+        stepsChecklist = await this._addChecklist(card.id, 'Steps');
+      }
+
+      if (stepsChecklist && goal.steps) {
+        const existingItems = new Map();
+        for (const item of stepsChecklist.checkItems) {
+          existingItems.set(item.name, item);
+        }
+
+        for (const step of goal.steps) {
+          const itemName = step.description?.slice(0, 100) ?? step.id;
+          if (!existingItems.has(itemName)) {
+            await this._addCheckItem(stepsChecklist.id, itemName);
+          } else {
+            const item = existingItems.get(itemName);
+            const expectedState = step.status === 'done' ? 'complete' : 'incomplete';
+            if (item.state !== expectedState) {
+              await this._updateCheckItem(card.id, item.id, expectedState);
             }
           }
         }
-      } catch {
-        // Not a goal card or parse error
+      }
+
+      // Handle kernel events (verbose logging)
+      const recentEvents = kernelEvents.filter(e => e.goalId === meta.goalId);
+      for (const event of recentEvents) {
+        let comment = '';
+        switch (event.type) {
+          case 'phase':
+            comment = `[🤖 OODA] ${event.phase} phase (cycle ${event.cycle}, ${event.durationMs}ms)`;
+            break;
+          case 'escalation':
+            comment = `[⚠️ ESCALATION] ${event.message}`;
+            // Move to Escalations
+            if (this.listIds.escalations && card.idList !== this.listIds.escalations) {
+              await this._updateCard(card.id, { idList: this.listIds.escalations });
+              comment += ' - Moved to Escalations';
+              if (this.danMember) {
+                comment += ` @${this.danMember.username}`;
+              }
+            }
+            break;
+          case 'complete':
+            comment = `[✅ COMPLETE] Goal finished with ${event.progress}% progress`;
+            // Move to Done
+            if (this.listIds.done && card.idList !== this.listIds.done) {
+              await this._updateCard(card.id, { idList: this.listIds.done });
+              comment += ' - Moved to Done';
+            }
+            break;
+          case 'error':
+            comment = `[❌ ERROR] ${event.message}`;
+            break;
+        }
+        if (comment) {
+          await this._addComment(card.id, comment);
+        }
       }
     }
-
-    return updates;
   }
 
   // ─────────────────────────────────────────────────
   // Auto-sync loop
   // ─────────────────────────────────────────────────
 
-  /**
-   * Start periodic sync.
-   * @param {Function} onTrelloChange - callback(updates) when Trello has human changes
-   */
-  start(store, onTrelloChange) {
+  start(store, onKernelEvent, triggerGoalApi) {
     if (this.disabled) return;
     if (this._running) return;
 
-    this._running = true;
-    console.log('[trello-sync] Starting sync loop');
+    this._triggerGoalApi = triggerGoalApi;
+    this._kernelEventBuffer = [];
+    this._onKernelEvent = onKernelEvent;
 
-    this._intervalId = setInterval(async () => {
-      try {
-        // Push OODA changes to Trello
-        await this.syncGoalsToTrello(store);
+    this._init().then(() => {
+      this._running = true;
+      console.log('[trello-sync] Starting sync loop v2');
 
-        // Pull Trello changes back to OODA
-        const updates = await this.syncFromTrello(store);
-        if ((updates.goals.length > 0 || updates.steps.length > 0) && onTrelloChange) {
-          onTrelloChange(updates);
+      this._intervalId = setInterval(async () => {
+        try {
+          // Buffer kernel events
+          if (this._onKernelEvent) {
+            const events = this._onKernelEvent();
+            if (events?.length) {
+              this._kernelEventBuffer.push(...events);
+              // Keep only last 20 events
+              this._kernelEventBuffer = this._kernelEventBuffer.slice(-20);
+            }
+          }
+
+          // 1. Trello -> OODA: check for new goals
+          await this.syncTrelloToOODA(store);
+
+          // 2. OODA -> Trello: update existing goals
+          await this.syncOODAToTrello(store, this._kernelEventBuffer);
+
+          // Clear consumed events
+          this._kernelEventBuffer = [];
+        } catch (err) {
+          console.error('[trello-sync] Sync error:', err.message);
         }
-      } catch (err) {
-        console.error('[trello-sync] Sync error:', err.message);
-      }
-    }, this.syncIntervalMs);
+      }, this.syncIntervalMs);
+    });
   }
 
   stop() {

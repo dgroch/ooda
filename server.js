@@ -74,31 +74,9 @@ const trelloSync = new TrelloSyncAdapter({
   syncIntervalMs: parseInt(process.env.TRELLO_SYNC_INTERVAL_MS ?? '30000'),
 });
 
-// Handle Trello→OODA updates (human moved a card, checked a step)
-const handleTrelloUpdate = async (updates) => {
-  console.log('[trello-sync] Processing Trello updates:', updates);
-  for (const goalUpdate of updates.goals) {
-    const goals = await store.listGoals();
-    const goalRow = goals.find((g) => g.id === goalUpdate.id);
-    if (goalRow) {
-      const goal = typeof goalRow.data === 'string' ? JSON.parse(goalRow.data) : goalRow.data;
-      goal.status = goalUpdate.status;
-      await store.upsertGoal(goal);
-    }
-  }
-  for (const stepUpdate of updates.steps) {
-    const goals = await store.listGoals();
-    const goalRow = goals.find((g) => g.id === stepUpdate.goalId);
-    if (goalRow) {
-      const goal = typeof goalRow.data === 'string' ? JSON.parse(goalRow.data) : goalRow.data;
-      const step = goal.steps?.find((s) => s.id === stepUpdate.stepId);
-      if (step) {
-        step.status = stepUpdate.status;
-        await store.upsertGoal(goal);
-      }
-    }
-  }
-};
+// Kernel event buffer for Trello verbose logging
+const kernelEventBuffer = [];
+const MAX_KERNEL_EVENTS = 50;
 
 // ─────────────────────────────────────────────
 // Registries (register your skills + tools here)
@@ -320,6 +298,40 @@ const kernel = new AgentKernel({
     const override = event.output?.structuralOverride ? ' ⛔ OVERRIDE' : '';
     const complete = event.output?.goalComplete ? ' ✅ DONE' : '';
     console.log(`[kernel] ${event.phase.padEnd(9)} cycle=${event.cycle} (${event.durationMs}ms)${override}${complete}`);
+
+    // Buffer events for Trello verbose logging
+    const goalId = event.output?.goalId ?? event.input?.goalId ?? event.output?.orientation?.goalId ?? null;
+    if (goalId) {
+      kernelEventBuffer.push({
+        type: 'phase',
+        phase: event.phase,
+        cycle: event.cycle,
+        durationMs: event.durationMs,
+        goalId,
+        override: !!event.output?.structuralOverride,
+        timestamp: Date.now(),
+      });
+      if (event.output?.goalComplete) {
+        kernelEventBuffer.push({
+          type: 'complete',
+          goalId,
+          progress: 100,
+          timestamp: Date.now(),
+        });
+      }
+      if (event.output?.mustEscalate) {
+        kernelEventBuffer.push({
+          type: 'escalation',
+          goalId,
+          message: event.output?.escalationVerdict?.reason ?? 'Escalation required',
+          timestamp: Date.now(),
+        });
+      }
+      // Keep buffer bounded
+      if (kernelEventBuffer.length > MAX_KERNEL_EVENTS) {
+        kernelEventBuffer.splice(0, kernelEventBuffer.length - MAX_KERNEL_EVENTS);
+      }
+    }
   },
   maxCycles: config.maxCycles,
   confidenceThreshold: config.confidenceThreshold,
@@ -332,9 +344,28 @@ const kernel = new AgentKernel({
 const harness = new ActivationHarness(kernel, {
   onResult: (result, trigger) => {
     console.log(`[harness] Activation complete: ${result.status} (${result.cycles} cycles, progress: ${result.goalProgress})`);
+    // Buffer completion for Trello
+    const goalId = trigger?.payload?.goalId;
+    if (goalId && result.status !== 'complete') {
+      kernelEventBuffer.push({
+        type: 'complete',
+        goalId,
+        progress: result.goalProgress ?? 0,
+        timestamp: Date.now(),
+      });
+    }
   },
   onError: (err, trigger) => {
     console.error(`[harness] Activation failed:`, err.message);
+    const goalId = trigger?.payload?.goalId;
+    if (goalId) {
+      kernelEventBuffer.push({
+        type: 'error',
+        goalId,
+        message: err.message,
+        timestamp: Date.now(),
+      });
+    }
   },
   maxConcurrent: 1,
 });
@@ -801,7 +832,47 @@ Waiting for events...
 
   // Start Trello sync if configured
   if (!trelloSync.disabled) {
-    trelloSync.start(store, handleTrelloUpdate);
+    // triggerGoalApi: called when Trello card enters Goals list
+    const triggerGoalApi = async (goalSpec) => {
+      const goal = {
+        id: goalSpec.id,
+        description: goalSpec.description,
+        priority: goalSpec.priority ?? 1,
+        steps: (goalSpec.steps ?? []).map((s, i) => ({
+          id: s.id ?? `step_${i + 1}`,
+          description: s.description,
+          skillRequired: s.skillRequired ?? '',
+          toolsRequired: s.toolsRequired ?? [],
+          dependencies: s.dependencies ?? [],
+          status: 'pending',
+        })),
+        criteria: goalSpec.criteria ?? [],
+        status: 'active',
+        assignedBy: 'trello',
+      };
+      await memory.upsertGoal(goal);
+      console.log(`[trello-sync] Goal created from Trello: "${goal.description}" (${goal.steps.length} steps)`);
+
+      if (config.autoRunGoals) {
+        harness.emit('goal_assigned', {
+          goalId: goal.id,
+          assignedBy: 'trello',
+          description: goal.description,
+          reason: 'Goal moved to Goals list in Trello',
+        }, `goal:${goal.id}`).catch((err) => {
+          console.error(`[trello-sync] Failed to activate goal ${goal.id}:`, err.message);
+        });
+      }
+    };
+
+    // onKernelEvent: returns buffered events for Trello comments
+    const onKernelEvent = () => {
+      const events = [...kernelEventBuffer];
+      kernelEventBuffer.length = 0;
+      return events;
+    };
+
+    trelloSync.start(store, onKernelEvent, triggerGoalApi);
   }
 });
 
