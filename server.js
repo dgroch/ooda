@@ -26,6 +26,8 @@
 import express from 'express';
 import { createHmac, timingSafeEqual } from 'crypto';
 import { AgentKernel, ActivationHarness, MemoryManager, SkillRegistry, ToolRegistry, InMemoryStore } from './kernel.js';
+import { SqliteStore } from './store-sqlite.js';
+import { TrelloSyncAdapter } from './trello-sync.js';
 
 // ─────────────────────────────────────────────
 // HTTPS Requirement (enforce in production)
@@ -57,9 +59,46 @@ const config = {
 // Persistence
 // ─────────────────────────────────────────────
 
-// Use InMemoryStore on Node <22 (node:sqlite requires Node 22+)
-const store = new InMemoryStore();
+// Use SQLite for persistence (requires Node 22+)
+// Falls back to InMemoryStore if DB_PATH is ':memory:'
+const useSqlite = config.dbPath !== ':memory:';
+const store = useSqlite ? new SqliteStore(config.dbPath) : new InMemoryStore();
+console.log(`[store] Using ${useSqlite ? 'SQLite' : 'InMemory'}: ${config.dbPath}`);
 const memory = new MemoryManager(store);
+
+// ─────────────────────────────────────────────
+// Trello Sync (optional)
+// ─────────────────────────────────────────────
+
+const trelloSync = new TrelloSyncAdapter({
+  syncIntervalMs: parseInt(process.env.TRELLO_SYNC_INTERVAL_MS ?? '30000'),
+});
+
+// Handle Trello→OODA updates (human moved a card, checked a step)
+const handleTrelloUpdate = async (updates) => {
+  console.log('[trello-sync] Processing Trello updates:', updates);
+  for (const goalUpdate of updates.goals) {
+    const goals = await store.listGoals();
+    const goalRow = goals.find((g) => g.id === goalUpdate.id);
+    if (goalRow) {
+      const goal = typeof goalRow.data === 'string' ? JSON.parse(goalRow.data) : goalRow.data;
+      goal.status = goalUpdate.status;
+      await store.upsertGoal(goal);
+    }
+  }
+  for (const stepUpdate of updates.steps) {
+    const goals = await store.listGoals();
+    const goalRow = goals.find((g) => g.id === stepUpdate.goalId);
+    if (goalRow) {
+      const goal = typeof goalRow.data === 'string' ? JSON.parse(goalRow.data) : goalRow.data;
+      const step = goal.steps?.find((s) => s.id === stepUpdate.stepId);
+      if (step) {
+        step.status = stepUpdate.status;
+        await store.upsertGoal(goal);
+      }
+    }
+  }
+};
 
 // ─────────────────────────────────────────────
 // Registries (register your skills + tools here)
@@ -759,18 +798,25 @@ Waiting for events...
   // Example:
   //   harness.cron('daily_review', 86400000, 'Daily progress check');
   harness.start();
+
+  // Start Trello sync if configured
+  if (!trelloSync.disabled) {
+    trelloSync.start(store, handleTrelloUpdate);
+  }
 });
 
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\n[shutdown] Stopping...');
   harness.stop();
+  trelloSync.stop();
   if (store?.close) store.close();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
   harness.stop();
+  trelloSync.stop();
   if (store?.close) store.close();
   process.exit(0);
 });

@@ -94,10 +94,54 @@ class SqliteStore {
       )
     `);
 
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS gaps (
+        id          TEXT PRIMARY KEY,
+        goal_id     TEXT,
+        step_id     TEXT,
+        gap_type    TEXT,
+        data        TEXT,
+        created_at  TEXT DEFAULT (datetime('now'))
+      )
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS research_results (
+        id          TEXT PRIMARY KEY,
+        gap_id      TEXT,
+        gap_type    TEXT,
+        status      TEXT,
+        data        TEXT,
+        created_at  TEXT DEFAULT (datetime('now'))
+      )
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS acquisition_events (
+        id          TEXT PRIMARY KEY,
+        goal_id     TEXT,
+        capability_type TEXT,
+        capability_id   TEXT,
+        data        TEXT,
+        created_at  TEXT DEFAULT (datetime('now'))
+      )
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS retry_counts (
+        step_id     TEXT PRIMARY KEY,
+        count       INTEGER DEFAULT 0
+      )
+    `);
+
     this._ensureSchemaCompatibility();
 
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_episodes_timestamp ON episodes(timestamp)`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_episodes_activation ON episodes(activation_id)`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_gaps_step ON gaps(step_id)`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_gaps_goal ON gaps(goal_id)`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_research_gap ON research_results(gap_id)`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_acquisition_goal ON acquisition_events(goal_id)`);
 
     // Prepared statements for performance
     this._get = this.db.prepare('SELECT value FROM kv WHERE key = ?');
@@ -130,11 +174,11 @@ class SqliteStore {
     this._skillGetAll = this.db.prepare('SELECT * FROM skills');
 
     // Goal statements
-    this._goalUpsert = this.db.prepare('INSERT OR REPLACE INTO goals (id, data, updated_at) VALUES (?, ?, datetime("now"))');
+    this._goalUpsert = this.db.prepare(`INSERT OR REPLACE INTO goals (id, data, updated_at) VALUES (?, ?, datetime('now'))`);
     this._goalGetAll = this.db.prepare('SELECT * FROM goals');
 
     // Knowledge statements
-    this._knowledgeUpsert = this.db.prepare('INSERT OR REPLACE INTO knowledge (id, data, confidence, learned_at) VALUES (?, ?, ?, datetime("now"))');
+    this._knowledgeUpsert = this.db.prepare(`INSERT OR REPLACE INTO knowledge (id, data, confidence, learned_at) VALUES (?, ?, ?, datetime('now'))`);
     this._knowledgeGetAll = this.db.prepare('SELECT * FROM knowledge');
   }
 
@@ -346,6 +390,87 @@ class SqliteStore {
       if (r.data) return JSON.parse(r.data);
       return { id: r.id, confidence: r.confidence };
     });
+  }
+
+  // ── Gaps ──────────────────────────────────────────
+
+  async saveGap(gap) {
+    const id = gap.id ?? `gap_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    this.db.prepare(
+      `INSERT OR REPLACE INTO gaps (id, goal_id, step_id, gap_type, data, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))`
+    ).run(id, gap.goalId ?? null, gap.stepId ?? null, gap.gapType ?? null, JSON.stringify(gap));
+    return { ...gap, id };
+  }
+
+  async getGapHistory(stepId) {
+    if (!stepId) return [];
+    return this.db.prepare('SELECT data FROM gaps WHERE step_id = ? ORDER BY created_at ASC').all(stepId)
+      .map((r) => JSON.parse(r.data));
+  }
+
+  async getGapsByGoal(goalId) {
+    if (!goalId) return [];
+    return this.db.prepare('SELECT data FROM gaps WHERE goal_id = ? ORDER BY created_at ASC').all(goalId)
+      .map((r) => JSON.parse(r.data));
+  }
+
+  // ── Research Results ──────────────────────────────────
+
+  async saveResearchResult(result) {
+    const id = result.id ?? `res_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    this.db.prepare(
+      `INSERT OR REPLACE INTO research_results (id, gap_id, gap_type, status, data, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))`
+    ).run(id, result.gapId ?? null, result.gapType ?? null, result.status ?? null, JSON.stringify(result));
+    return { ...result, id };
+  }
+
+  async getResearchHistory(gapId) {
+    if (!gapId) return [];
+    return this.db.prepare('SELECT data FROM research_results WHERE gap_id = ? ORDER BY created_at ASC').all(gapId)
+      .map((r) => JSON.parse(r.data));
+  }
+
+  // ── Acquisition Events ──────────────────────────────────
+
+  async saveAcquisitionEvent(event) {
+    const id = event.id ?? `acq_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const goalId = event.gapContext?.goalId ?? null;
+    this.db.prepare(
+      `INSERT OR REPLACE INTO acquisition_events (id, goal_id, capability_type, capability_id, data, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))`
+    ).run(id, goalId, event.capabilityType ?? event.type ?? null, event.capabilityId ?? null, JSON.stringify(event));
+    return { ...event, id };
+  }
+
+  async getAcquisitionHistory(goalId) {
+    if (!goalId) {
+      return this.db.prepare('SELECT data FROM acquisition_events ORDER BY created_at ASC').all()
+        .map((r) => JSON.parse(r.data));
+    }
+    return this.db.prepare('SELECT data FROM acquisition_events WHERE goal_id = ? ORDER BY created_at ASC').all(goalId)
+      .map((r) => JSON.parse(r.data));
+  }
+
+  // ── Retry Counts ──────────────────────────────────
+
+  async getRetryCount(stepId) {
+    if (!stepId) return 0;
+    const row = this.db.prepare('SELECT count FROM retry_counts WHERE step_id = ?').get(stepId);
+    return row?.count ?? 0;
+  }
+
+  async incrementRetryCount(stepId) {
+    if (!stepId) return 0;
+    this.db.prepare(
+      'INSERT INTO retry_counts (step_id, count) VALUES (?, 1) ON CONFLICT(step_id) DO UPDATE SET count = count + 1'
+    ).run(stepId);
+    const row = this.db.prepare('SELECT count FROM retry_counts WHERE step_id = ?').get(stepId);
+    return row?.count ?? 1;
+  }
+
+  async resetRetryCount(stepId) {
+    if (!stepId) return 0;
+    this.db.prepare('INSERT INTO retry_counts (step_id, count) VALUES (?, 0) ON CONFLICT(step_id) DO UPDATE SET count = 0').run(stepId);
+    return 0;
   }
 
   close() {
