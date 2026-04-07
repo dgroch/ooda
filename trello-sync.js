@@ -137,8 +137,9 @@ export class TrelloSyncAdapter {
         // No valid JSON in desc, treat as new
       }
 
-      // If no OODA metadata, this is a new goal to trigger
-      if (!meta.oodaManaged) {
+      // Trigger if: no OODA metadata, OR managed but steps were 0 and now there are steps
+      const stepsAreMissing = meta.oodaManaged && Array.isArray(meta.steps) && meta.steps.length === 0;
+      if (!meta.oodaManaged || stepsAreMissing) {
         console.log(`[trello-sync] NEW GOAL from Trello: "${card.name}"`);
 
         // Extract steps from ALL checklists on the card
@@ -150,6 +151,12 @@ export class TrelloSyncAdapter {
           status: item.state === 'complete' ? 'done' : 'pending',
         }));
         console.log(`[trello-sync] Found ${checklists.length} checklists, ${steps.length} steps:`, steps.map(s => s.description));
+
+        // If still no steps, skip — wait for user to add them
+        if (steps.length === 0) {
+          console.log(`[trello-sync] No steps yet for "${card.name}" — waiting`);
+          continue;
+        }
 
         // Trigger OODA via API
         if (this._triggerGoalApi) {
