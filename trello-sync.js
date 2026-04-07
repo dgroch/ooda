@@ -22,13 +22,14 @@ async function trelloFetch(path, options = {}) {
   const sep = path.includes('?') ? '&' : '?';
   const authPath = `${path}${sep}key=${this?.apiKey}&token=${this?.token}`;
   const url = `${TRELLO_BASE}${authPath}`;
-  const defaults = {
-    headers: { 'Content-Type': 'application/json' },
-  };
-  const opts = { ...defaults, ...options };
+  const isWrite = options.method && options.method !== 'GET';
+  const headers = isWrite ? { 'Content-Type': 'application/json' } : {};
+  const opts = { ...options, headers: { ...headers, ...(options.headers ?? {}) } };
+  console.log(`[trello-fetch] ${opts.method ?? 'GET'} ${url.replace(/key=[^&]+/, 'key=***').replace(/token=[^&]+/, 'token=***')}`);
   const response = await fetch(url, opts);
   if (!response.ok) {
     const err = await response.text();
+    console.error(`[trello-fetch] ${response.status}: ${err}`);
     throw new Error(`Trello ${response.status}: ${err}`);
   }
   return response.json();
