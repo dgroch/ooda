@@ -249,12 +249,17 @@ export class TrelloSyncAdapter {
       // Find corresponding OODA goal
       const oodaGoal = oodaGoals.find(g => {
         const gData = typeof g.data === 'string' ? JSON.parse(g.data) : g.data;
+        // Match by OODA goal ID stored in card desc
+        // Also skip goals that are already done (prevents cross-goal step pollution)
         return gData?.id === meta.goalId;
       });
 
       if (!oodaGoal) continue;
 
       const goal = typeof oodaGoal.data === 'string' ? JSON.parse(oodaGoal.data) : oodaGoal.data;
+
+      // Skip already-done goals — their state is final, no updates needed
+      if (goal.status === 'done') continue;
 
       // Sync step completion back to Trello checklist
       // Match steps to ANY checklist on the card (not just one named 'Steps')

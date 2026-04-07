@@ -2521,12 +2521,24 @@ Return JSON: { "summarised": [{ "id": "...", "text": "...", "tokens": N }] }`,
       phase = activation;
       activation = { id: 'activation_unknown' };
     }
+    // Use a safe replacer to strip functions, Maps, Sets, and circular refs
+    const seen = new WeakSet();
+    const replacer = (key, value) => {
+      if (typeof value === 'function') return undefined;
+      if (value instanceof Map) return Object.fromEntries(value);
+      if (value instanceof Set) return [...value];
+      if (typeof value === 'object' && value !== null) {
+        if (seen.has(value)) return '[circular]';
+        seen.add(value);
+      }
+      return value;
+    };
     return JSON.stringify({
       phase,
       activationId: activation.id,
       agentIdentity: context.identity,
       ...context,
-    });
+    }, replacer);
   }
 
   _emit(activation, phase, input, output, durationMs) {

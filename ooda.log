@@ -17,7 +17,7 @@ Endpoints:
 Waiting for events...
 
 [trello-fetch] GET https://api.trello.com/1/boards/buuHSCC2/lists?fields=id,name&key=***&token=***
-[kernel] observe   cycle=1 (38ms)
+[kernel] observe   cycle=1 (30ms)
 [trello-sync] Lists: {
   draft: '69d46257fabde12ddc5d5493',
   goals: '69d47e8dfb3ec9796de9003b',
@@ -28,94 +28,123 @@ Waiting for events...
 [trello-fetch] GET https://api.trello.com/1/boards/buuHSCC2/members?fields=id,username&key=***&token=***
 [trello-sync] Dan member: { id: '50be7a826001fe4a58001331', username: 'danielgroch' }
 [trello-sync] Starting sync loop v2
-[kernel] orient    cycle=1 (3370ms)
-[kernel] reflect   cycle=1 (3661ms)
+[harness] Activation failed: LLM API error 400: {
+    "error": {
+        "message": "We could not parse the JSON body of your request. (HINT: This likely means you aren't using your HTTP library correctly. The OpenAI API expects a JSON payload, but what was sent was not valid JSON. If you have trouble figuring out how to fix this, please contact us through our help center at help.openai.com.)",
+        "type": "invalid_request_error",
+        "param": null,
+        "code": null
+    }
+}
+
+[kernel] observe   cycle=1 (1ms)
+[kernel] orient    cycle=1 (2782ms)
+[kernel] reflect   cycle=1 (2015ms)
 [kernel] decide    cycle=1 (0ms)
 [kernel] act       cycle=1 (0ms)
-[kernel] integrate cycle=1 (4ms)
+[kernel] integrate cycle=1 (2ms)
 [harness] Activation complete: paused (1 cycles, progress: 0)
-[kernel] observe   cycle=1 (1ms)
-[kernel] orient    cycle=1 (2506ms)
-[goals] Assigned: "Write a blog post for Mothers Day for florist Fig and Bloom" (3 steps)
-[kernel] reflect   cycle=1 (2783ms)
+[kernel] observe   cycle=1 (0ms)
+[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
+[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
+[trello-sync] NEW GOAL from Trello: "Create Mother's Day Marketing campaign"
+[trello-fetch] GET https://api.trello.com/1/cards/69d4aab4b7841de2073af850/checklists?fields=id,name,checkItems&key=***&token=***
+[trello-sync] Found 1 checklists, 3 steps: [
+  'Generate creatives for social media advertisements',
+  'Run a social media contest with another brand',
+  "Create three marketing emails for Mother's Day"
+]
+[trello-sync] Goal created from Trello: "Create Mother's Day Marketing campaign" (3 steps)
+[trello-fetch] POST https://api.trello.com/1/cards/69d4aab4b7841de2073af850/actions/comments?key=***&token=***
+[kernel] orient    cycle=1 (2333ms)
+[trello-fetch] PUT https://api.trello.com/1/cards/69d4aab4b7841de2073af850?key=***&token=***
+[trello-fetch] PUT https://api.trello.com/1/cards/69d4aab4b7841de2073af850?key=***&token=***
+[trello-fetch] POST https://api.trello.com/1/cards/69d4aab4b7841de2073af850/actions/comments?key=***&token=***
+[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
+[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
+[kernel] reflect   cycle=1 (1985ms)
 [kernel] decide    cycle=1 (0ms)
 [kernel] act       cycle=1 (0ms)
 [kernel] integrate cycle=1 (1ms)
 [harness] Activation complete: paused (1 cycles, progress: 0)
-[kernel] observe   cycle=1 (1ms)
-[kernel] orient    cycle=1 (3449ms)
-[kernel] reflect   cycle=1 (4865ms)
+[kernel] observe   cycle=1 (0ms)
+[trello-fetch] GET https://api.trello.com/1/lists/69d47e6a12766484cd71c06a/cards?fields=id,name,desc,idList,checklists&key=***&token=***
+[trello-fetch] GET https://api.trello.com/1/cards/69d4aab4b7841de2073af850/checklists?fields=id,name,checkItems&key=***&token=***
+[kernel] orient    cycle=1 (2747ms)
+[kernel] reflect   cycle=1 (4346ms)
 [kernel] decide    cycle=1 (0ms) ⛔ OVERRIDE
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[kernel] act       cycle=1 (2900ms)
+[kernel] act       cycle=1 (3837ms)
 [kernel] integrate cycle=1 (3ms)
 [kernel] observe   cycle=2 (0ms)
+[kernel] orient    cycle=2 (2617ms)
+[kernel] reflect   cycle=2 (4412ms)
+[kernel] decide    cycle=2 (0ms) ⛔ OVERRIDE
+[kernel] act       cycle=2 (2492ms)
+[kernel] integrate cycle=2 (4ms)
+[kernel] observe   cycle=3 (0ms)
+[kernel] orient    cycle=3 (1958ms)
+[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
+[kernel] reflect   cycle=3 (4089ms)
+[kernel] decide    cycle=3 (0ms) ⛔ OVERRIDE
+[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
 [trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
 [trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
 [trello-fetch] GET https://api.trello.com/1/lists/69d47e6a12766484cd71c06a/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[kernel] orient    cycle=2 (2502ms)
-[kernel] reflect   cycle=2 (5014ms)
-[kernel] decide    cycle=2 (0ms) ⛔ OVERRIDE
-[kernel] act       cycle=2 (2285ms)
-[kernel] integrate cycle=2 (3ms)
-[kernel] observe   cycle=3 (1ms)
-[kernel] orient    cycle=3 (1601ms)
-[kernel] reflect   cycle=3 (3297ms)
-[kernel] decide    cycle=3 (0ms) ⛔ OVERRIDE
-[kernel] act       cycle=3 (1995ms)
-[kernel] integrate cycle=3 (2ms) ✅ DONE
+[trello-fetch] GET https://api.trello.com/1/cards/69d4aab4b7841de2073af850/checklists?fields=id,name,checkItems&key=***&token=***
+[trello-sync] Updating step "Generate creatives for social media advertisements" -> complete
+[trello-fetch] PUT https://api.trello.com/1/cards/69d4aab4b7841de2073af850/checkItem/69d4aac9c1f6a5ec18453d11?key=***&token=***
+[trello-sync] Updating step "Run a social media contest with another brand" -> complete
+[trello-fetch] PUT https://api.trello.com/1/cards/69d4aab4b7841de2073af850/checkItem/69d4aad780b1a0250b2b247e?key=***&token=***
+[trello-fetch] POST https://api.trello.com/1/cards/69d4aab4b7841de2073af850/actions/comments?key=***&token=***
+[kernel] act       cycle=3 (6104ms)
+[kernel] integrate cycle=3 (3ms) ✅ DONE
 [harness] Activation complete: complete (3 cycles, progress: 1)
 [kernel] observe   cycle=1 (0ms)
-[kernel] orient    cycle=1 (2466ms)
-[kernel] reflect   cycle=1 (2161ms)
+[trello-fetch] POST https://api.trello.com/1/cards/69d4aab4b7841de2073af850/actions/comments?key=***&token=***
+[trello-fetch] POST https://api.trello.com/1/cards/69d4aab4b7841de2073af850/actions/comments?key=***&token=***
+[kernel] orient    cycle=1 (2293ms)
+[kernel] reflect   cycle=1 (2712ms)
 [kernel] decide    cycle=1 (0ms)
 [kernel] act       cycle=1 (0ms)
 [kernel] integrate cycle=1 (2ms)
-[harness] Activation complete: paused (1 cycles, progress: 0)
-[kernel] observe   cycle=1 (1ms)
-[kernel] orient    cycle=1 (3645ms)
-[kernel] reflect   cycle=1 (2367ms)
-[kernel] decide    cycle=1 (0ms)
-[kernel] act       cycle=1 (0ms)
-[kernel] integrate cycle=1 (2ms)
-[harness] Activation complete: paused (1 cycles, progress: 0)
-[kernel] observe   cycle=1 (1ms)
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e6a12766484cd71c06a/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[kernel] orient    cycle=1 (3477ms)
-[kernel] reflect   cycle=1 (1750ms)
-[kernel] decide    cycle=1 (0ms)
-[kernel] act       cycle=1 (0ms)
-[kernel] integrate cycle=1 (2ms)
-[harness] Activation complete: paused (1 cycles, progress: 0)
-[kernel] observe   cycle=1 (1ms)
-[kernel] orient    cycle=1 (3655ms)
-[kernel] reflect   cycle=1 (2775ms)
-[kernel] decide    cycle=1 (0ms)
-[kernel] act       cycle=1 (0ms)
-[kernel] integrate cycle=1 (3ms)
 [harness] Activation complete: paused (1 cycles, progress: 0)
 [kernel] observe   cycle=1 (0ms)
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[kernel] orient    cycle=1 (2342ms)
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e6a12766484cd71c06a/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[kernel] reflect   cycle=1 (1914ms)
+[kernel] orient    cycle=1 (2849ms)
+[kernel] reflect   cycle=1 (2083ms)
 [kernel] decide    cycle=1 (0ms)
 [kernel] act       cycle=1 (0ms)
-[kernel] integrate cycle=1 (1ms)
+[kernel] integrate cycle=1 (2ms)
 [harness] Activation complete: paused (1 cycles, progress: 0)
 [kernel] observe   cycle=1 (1ms)
-[kernel] orient    cycle=1 (2585ms)
-[kernel] reflect   cycle=1 (2320ms)
+[kernel] orient    cycle=1 (2383ms)
+[kernel] reflect   cycle=1 (3317ms)
 [kernel] decide    cycle=1 (0ms)
-[kernel] act       cycle=1 (1ms)
+[kernel] act       cycle=1 (0ms)
+[kernel] integrate cycle=1 (2ms)
+[harness] Activation complete: paused (1 cycles, progress: 0)
+[kernel] observe   cycle=1 (1ms)
+[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
+[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
+[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
+[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
+[trello-fetch] GET https://api.trello.com/1/lists/69d47e6a12766484cd71c06a/cards?fields=id,name,desc,idList,checklists&key=***&token=***
+[trello-fetch] GET https://api.trello.com/1/cards/69d4aab4b7841de2073af850/checklists?fields=id,name,checkItems&key=***&token=***
+[kernel] orient    cycle=1 (2888ms)
+[trello-sync] Updating step "Create three marketing emails for Mother's Day" -> complete
+[trello-fetch] PUT https://api.trello.com/1/cards/69d4aab4b7841de2073af850/checkItem/69d4aae65256e71ae1a12f03?key=***&token=***
+[trello-sync] Goal complete — moving card to Done
+[trello-fetch] PUT https://api.trello.com/1/cards/69d4aab4b7841de2073af850?key=***&token=***
+[trello-fetch] POST https://api.trello.com/1/cards/69d4aab4b7841de2073af850/actions/comments?key=***&token=***
+[kernel] reflect   cycle=1 (4076ms)
+[kernel] decide    cycle=1 (0ms)
+[kernel] act       cycle=1 (0ms)
+[kernel] integrate cycle=1 (2ms)
+[harness] Activation complete: paused (1 cycles, progress: 0)
+[kernel] observe   cycle=1 (1ms)
+[kernel] orient    cycle=1 (2813ms)
+[kernel] reflect   cycle=1 (2772ms)
+[kernel] decide    cycle=1 (0ms)
+[kernel] act       cycle=1 (0ms)
 [kernel] integrate cycle=1 (1ms)
 [harness] Activation complete: paused (1 cycles, progress: 0)
 [kernel] observe   cycle=1 (0ms)
@@ -124,84 +153,16 @@ Waiting for events...
 [trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
 [trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
 [trello-fetch] GET https://api.trello.com/1/lists/69d47e6a12766484cd71c06a/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[kernel] orient    cycle=1 (2642ms)
-[kernel] reflect   cycle=1 (2364ms)
+[kernel] orient    cycle=1 (3596ms)
+[kernel] reflect   cycle=1 (2270ms)
 [kernel] decide    cycle=1 (0ms)
 [kernel] act       cycle=1 (0ms)
 [kernel] integrate cycle=1 (2ms)
 [harness] Activation complete: paused (1 cycles, progress: 0)
 [kernel] observe   cycle=1 (1ms)
-[kernel] orient    cycle=1 (2525ms)
-[kernel] reflect   cycle=1 (2709ms)
-[kernel] decide    cycle=1 (0ms)
-[kernel] act       cycle=1 (0ms)
-[kernel] integrate cycle=1 (1ms)
-[harness] Activation complete: paused (1 cycles, progress: 0)
-[kernel] observe   cycle=1 (1ms)
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e6a12766484cd71c06a/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[kernel] orient    cycle=1 (3587ms)
-[kernel] reflect   cycle=1 (2301ms)
+[kernel] orient    cycle=1 (2139ms)
+[kernel] reflect   cycle=1 (2121ms)
 [kernel] decide    cycle=1 (0ms)
 [kernel] act       cycle=1 (0ms)
 [kernel] integrate cycle=1 (2ms)
 [harness] Activation complete: paused (1 cycles, progress: 0)
-[kernel] observe   cycle=1 (1ms)
-[kernel] orient    cycle=1 (2878ms)
-[kernel] reflect   cycle=1 (2619ms)
-[kernel] decide    cycle=1 (0ms)
-[kernel] act       cycle=1 (0ms)
-[kernel] integrate cycle=1 (2ms)
-[harness] Activation complete: paused (1 cycles, progress: 0)
-[goals] Assigned: "Write a short blog post about spring flowers for Fig and Bloom" (1 steps)
-[kernel] observe   cycle=1 (1ms)
-[kernel] orient    cycle=1 (1946ms)
-[kernel] reflect   cycle=1 (4996ms)
-[kernel] decide    cycle=1 (0ms) ⛔ OVERRIDE
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[kernel] act       cycle=1 (4293ms)
-[kernel] integrate cycle=1 (2ms) ✅ DONE
-[harness] Activation complete: complete (1 cycles, progress: 1)
-[kernel] observe   cycle=1 (1ms)
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e6a12766484cd71c06a/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[kernel] orient    cycle=1 (2500ms)
-[kernel] reflect   cycle=1 (1894ms)
-[kernel] decide    cycle=1 (0ms)
-[kernel] act       cycle=1 (0ms)
-[kernel] integrate cycle=1 (2ms)
-[harness] Activation complete: paused (1 cycles, progress: 0)
-[kernel] observe   cycle=1 (0ms)
-[kernel] orient    cycle=1 (2574ms)
-[kernel] reflect   cycle=1 (2682ms)
-[kernel] decide    cycle=1 (0ms)
-[kernel] act       cycle=1 (0ms)
-[kernel] integrate cycle=1 (2ms)
-[harness] Activation complete: paused (1 cycles, progress: 0)
-[kernel] observe   cycle=1 (0ms)
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[kernel] orient    cycle=1 (1814ms)
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e6a12766484cd71c06a/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[kernel] reflect   cycle=1 (2403ms)
-[kernel] decide    cycle=1 (0ms)
-[kernel] act       cycle=1 (0ms)
-[kernel] integrate cycle=1 (1ms)
-[harness] Activation complete: paused (1 cycles, progress: 0)
-[kernel] observe   cycle=1 (0ms)
-[kernel] orient    cycle=1 (3068ms)
-[kernel] reflect   cycle=1 (2908ms)
-[kernel] decide    cycle=1 (0ms)
-[kernel] act       cycle=1 (0ms)
-[kernel] integrate cycle=1 (2ms)
-[harness] Activation complete: paused (1 cycles, progress: 0)
-[kernel] observe   cycle=1 (1ms)
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e8dfb3ec9796de9003b/cards?fields=id,name,desc,idList,checklists&key=***&token=***
-[trello-fetch] GET https://api.trello.com/1/lists/69d47e60b7b851f655cffc3f/cards?fields=id,name,desc,idList,checklists&key=***&token=***
