@@ -1249,7 +1249,10 @@ Respond with JSON:
     const nextStep = (retryStepId ? readySteps.find((s) => s.id === retryStepId) : null)
       ?? readySteps[0]
       ?? null;
-    const hasRequiredSkill = nextStep ? this.skills.has(nextStep.skillRequired) : true;
+    // null/empty skillRequired means no skill needed → use execute_text path
+    const hasRequiredSkill = nextStep
+      ? (!nextStep.skillRequired || this.skills.has(nextStep.skillRequired))
+      : true;
 
     // Track cycles per step
     if (nextStep) {
