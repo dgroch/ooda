@@ -206,7 +206,7 @@ export class TrelloSyncAdapter {
 
       if (!item) {
         // Create new check item
-        await this._addChecklist(stepsChecklist.id, itemName);
+        await this._addCheckItem(stepsChecklist.id, itemName);
       } else {
         // Update state if changed
         const expectedState = step.status === 'done' ? 'complete' : 'incomplete';
