@@ -376,6 +376,26 @@ harness.registerEventType('goal_assigned');
 harness.registerEventType('goal_tick');
 harness.registerEventType('goal_resume');
 
+// Capture artifacts for Trello attachment delivery
+memory.on('artifact_produced', (payload) => {
+  if (!payload?.goalId || !payload?.artifact) return;
+  console.log(`[artifact] Produced for goal ${payload.goalId}: "${payload.stepDescription?.slice(0, 40)}" (${payload.artifact.length} chars)`);
+  kernelEventBuffer.push({
+    type: 'artifact',
+    goalId: payload.goalId,
+    stepId: payload.stepId,
+    stepDescription: payload.stepDescription,
+    artifact: payload.artifact,
+    summary: payload.summary,
+    mimeType: payload.mimeType ?? 'text/plain',
+    filename: payload.filename ?? 'output.txt',
+    timestamp: Date.now(),
+  });
+  if (kernelEventBuffer.length > MAX_KERNEL_EVENTS) {
+    kernelEventBuffer.splice(0, kernelEventBuffer.length - MAX_KERNEL_EVENTS);
+  }
+});
+
 memory.on('goal_resume_requested', (payload) => {
   if (!payload?.goalId) return;
   harness.emit('goal_resume', payload, 'kernel:retry-on-learn').catch((err) => {

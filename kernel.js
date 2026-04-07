@@ -1538,6 +1538,21 @@ Return JSON:
             confidence: completion.confidence ?? 0.5,
             notes: completion.notes ?? [],
           };
+          // Emit artifact event for downstream delivery (Trello attachment, etc)
+          if (outcome.artifact) {
+            const goalId = decided.resolvedGoal?.id ?? null;
+            const stepId = resolvedStep?.id ?? decided.decision?.nextStepId ?? null;
+            const stepDesc = resolvedStep?.description ?? '';
+            await this.memory.emit('artifact_produced', {
+              goalId,
+              stepId,
+              stepDescription: stepDesc,
+              artifact: outcome.artifact,
+              summary: outcome.summary,
+              mimeType: 'text/plain',
+              filename: `${stepDesc.slice(0, 40).replace(/[^a-z0-9]/gi, '-').toLowerCase() || 'output'}.txt`,
+            });
+          }
           break;
         }
         case 'use_tool': {

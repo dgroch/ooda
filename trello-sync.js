@@ -115,6 +115,23 @@ export class TrelloSyncAdapter {
     });
   }
 
+  async _attachFile(cardId, filename, content, mimeType = 'text/plain') {
+    // Trello attachment via multipart/form-data
+    const sep = cardId.includes('?') ? '&' : '?';
+    const url = `${TRELLO_BASE}/cards/${cardId}/attachments${sep}key=${this.apiKey}&token=${this.token}`;
+    const blob = new Blob([content], { type: mimeType });
+    const form = new FormData();
+    form.append('file', blob, filename);
+    form.append('name', filename);
+    console.log(`[trello-sync] Attaching file "${filename}" (${content.length} chars) to card ${cardId}`);
+    const response = await fetch(url, { method: 'POST', body: form });
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(`Trello attach ${response.status}: ${err}`);
+    }
+    return response.json();
+  }
+
   // ─────────────────────────────────────────────────
   // Sync: Trello → OODA (trigger new goals from Draft→Goals)
   // ─────────────────────────────────────────────────
@@ -273,7 +290,7 @@ export class TrelloSyncAdapter {
         }
       }
 
-      // Handle kernel events (verbose logging)
+      // Handle kernel events (verbose logging + artifact delivery)
       const recentEvents = kernelEvents.filter(e => e.goalId === meta.goalId);
       for (const event of recentEvents) {
         let comment = '';
@@ -281,9 +298,22 @@ export class TrelloSyncAdapter {
           case 'phase':
             comment = `[🤖 OODA] ${event.phase} phase (cycle ${event.cycle}, ${event.durationMs}ms)`;
             break;
+          case 'artifact': {
+            // Attach the artifact as a file to the Trello card
+            try {
+              await this._attachFile(card.id, event.filename, event.artifact, event.mimeType);
+              comment = `[📎 OODA] Artifact attached: "${event.filename}" — ${event.summary?.slice(0, 120) ?? ''}`;
+            } catch (err) {
+              comment = `[📎 OODA] Artifact ready (attach failed: ${err.message}): ${event.summary?.slice(0, 80) ?? ''}`;
+              // Fallback: post content as comment if file attach fails
+              if (event.artifact.length < 3000) {
+                await this._addComment(card.id, `[📄 OODA Output] ${event.stepDescription}\n\n${event.artifact}`);
+              }
+            }
+            break;
+          }
           case 'escalation':
             comment = `[⚠️ ESCALATION] ${event.message}`;
-            // Move to Escalations
             if (this.listIds.escalations && card.idList !== this.listIds.escalations) {
               await this._updateCard(card.id, { idList: this.listIds.escalations });
               comment += ' - Moved to Escalations';
@@ -293,8 +323,7 @@ export class TrelloSyncAdapter {
             }
             break;
           case 'complete':
-            comment = `[✅ COMPLETE] Goal finished with ${event.progress}% progress`;
-            // Move to Done
+            comment = `[✅ COMPLETE] Goal finished`;
             if (this.listIds.done && card.idList !== this.listIds.done) {
               await this._updateCard(card.id, { idList: this.listIds.done });
               comment += ' - Moved to Done';
