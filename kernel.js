@@ -954,8 +954,8 @@ class AgentKernel {
     // (that would create a self-reinforcing loop where halted -> failure -> stays halted forever).
     const isFailure = result.status === 'error'
       || result.reason === 'llm_circuit_open'
-      || result.reason === 'max_cycles_exceeded'
-      || (result.goalProgress != null && result.goalProgress === 0 && result.status === 'paused');
+      || result.reason === 'max_cycles_exceeded';
+    // NOTE: paused with 0 progress is NOT a failure — it can mean no active goals or awaiting input
     const isBreakerhalt = result.reason === 'activation_failure_limit_exceeded';
     if (!isBreakerhalt) {
       if (isFailure) {
