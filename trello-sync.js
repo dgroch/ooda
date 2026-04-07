@@ -179,8 +179,9 @@ export class TrelloSyncAdapter {
             });
             await this._addComment(card.id, `[🤖 OODA] Goal activated with ${steps.length} steps`);
 
-            // Mark as OODA managed
-            meta = { oodaManaged: true, goalId: card.id, steps: steps.map(s => s.id) };
+            // Mark as OODA managed — store OODA goal ID (not Trello card ID)
+            const oodaGoalId = `trello_${card.id.slice(0, 8)}`;
+            meta = { oodaManaged: true, goalId: oodaGoalId, steps: steps.map(s => s.id) };
             await this._updateCard(card.id, { desc: JSON.stringify(meta) });
 
             // Move to Doing
@@ -237,31 +238,38 @@ export class TrelloSyncAdapter {
 
       const goal = typeof oodaGoal.data === 'string' ? JSON.parse(oodaGoal.data) : oodaGoal.data;
 
-      // Sync step checklist
-      const checklists = await this._getChecklists(card.id);
-      let stepsChecklist = checklists.find(c => c.name === 'Steps');
-
-      if (goal.steps?.length && !stepsChecklist) {
-        stepsChecklist = await this._addChecklist(card.id, 'Steps');
-      }
-
-      if (stepsChecklist && goal.steps) {
-        const existingItems = new Map();
-        for (const item of stepsChecklist.checkItems) {
-          existingItems.set(item.name, item);
+      // Sync step completion back to Trello checklist
+      // Match steps to ANY checklist on the card (not just one named 'Steps')
+      if (goal.steps?.length) {
+        const checklists = await this._getChecklists(card.id);
+        // Build a flat map of all checklist items across all checklists
+        const allItemsMap = new Map();
+        const allItemCardMap = new Map(); // item name -> checklist id
+        for (const cl of checklists) {
+          for (const item of cl.checkItems ?? []) {
+            allItemsMap.set(item.name, item);
+            allItemCardMap.set(item.name, cl.id);
+          }
         }
 
         for (const step of goal.steps) {
           const itemName = step.description?.slice(0, 100) ?? step.id;
-          if (!existingItems.has(itemName)) {
-            await this._addCheckItem(stepsChecklist.id, itemName);
-          } else {
-            const item = existingItems.get(itemName);
+          const item = allItemsMap.get(itemName);
+          if (item) {
             const expectedState = step.status === 'done' ? 'complete' : 'incomplete';
             if (item.state !== expectedState) {
+              console.log(`[trello-sync] Updating step "${itemName}" -> ${expectedState}`);
               await this._updateCheckItem(card.id, item.id, expectedState);
             }
           }
+        }
+
+        // Move to Done if all steps complete
+        const allDone = goal.steps.every(s => s.status === 'done');
+        if (allDone && this.listIds.done && card.idList !== this.listIds.done) {
+          console.log(`[trello-sync] Goal complete — moving card to Done`);
+          await this._updateCard(card.id, { idList: this.listIds.done });
+          await this._addComment(card.id, `[✅ OODA] All steps complete — moved to Done`);
         }
       }
 
