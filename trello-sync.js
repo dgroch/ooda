@@ -58,13 +58,17 @@ export class TrelloSyncAdapter {
   }
 
   async _getOrCreateList(name) {
+    console.log(`[trello-sync] _getOrCreateList: ${name}`);
     const lists = await this._getLists();
+    console.log(`[trello-sync] Found lists:`, lists.map(l => l.name));
     let list = lists.find((l) => l.name === name);
     if (!list) {
+      console.log(`[trello-sync] Creating list: ${name}`);
       list = await this._trelloFetch(`/boards/${this.boardId}/lists`, {
         method: 'POST',
         body: JSON.stringify({ name, pos: 'bottom' }),
       });
+      console.log(`[trello-sync] Created list:`, list);
     }
     return list;
   }
