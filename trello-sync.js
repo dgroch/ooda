@@ -151,10 +151,15 @@ export class TrelloSyncAdapter {
         // Extract steps from ALL checklists on the card
         const checklists = await this._getChecklists(card.id);
         const allCheckItems = checklists.flatMap(c => c.checkItems ?? []);
+        // No skillRequired → kernel uses execute_text (plain LLM execution)
+        // Omitting skillRequired entirely avoids the research/skill-gap path
         const steps = allCheckItems.map((item, idx) => ({
           id: `step_${idx + 1}`,
           description: item.name,
           status: item.state === 'complete' ? 'done' : 'pending',
+          skillRequired: null,
+          toolsRequired: [],
+          dependencies: [],
         }));
         console.log(`[trello-sync] Found ${checklists.length} checklists, ${steps.length} steps:`, steps.map(s => s.description));
 

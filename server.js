@@ -849,7 +849,7 @@ Waiting for events...
         steps: (goalSpec.steps ?? []).map((s, i) => ({
           id: s.id ?? `step_${i + 1}`,
           description: s.description,
-          skillRequired: s.skillRequired ?? '',
+          skillRequired: s.skillRequired || null,
           toolsRequired: s.toolsRequired ?? [],
           dependencies: s.dependencies ?? [],
           status: 'pending',
