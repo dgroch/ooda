@@ -18,26 +18,14 @@
 const TRELLO_BASE = 'https://api.trello.com/1';
 
 async function trelloFetch(path, options = {}) {
-  const url = `${TRELLO_BASE}${path}`;
+  // Inject key/token as query params (Trello personal token auth)
+  const sep = path.includes('?') ? '&' : '?';
+  const authPath = `${path}${sep}key=${this?.apiKey}&token=${this?.token}`;
+  const url = `${TRELLO_BASE}${authPath}`;
   const defaults = {
     headers: { 'Content-Type': 'application/json' },
   };
   const opts = { ...defaults, ...options };
-  if (!opts.headers['Authorization']) {
-    opts.headers['Authorization'] = `OAuth apikey="${this?.apiKey}", oauth_token="${this?.token}"`;
-  }
-  // Inject query params for GET
-  if (opts.method === 'GET' || !opts.method) {
-    const params = new URLSearchParams(opts.qs ?? {});
-    const sep = url.includes('?') ? '&' : '?';
-    const fullUrl = params.toString() ? `${url}${sep}${params}` : url;
-    const response = await fetch(fullUrl, { ...opts, qs: undefined });
-    if (!response.ok) {
-      const err = await response.text();
-      throw new Error(`Trello ${response.status}: ${err}`);
-    }
-    return response.json();
-  }
   const response = await fetch(url, opts);
   if (!response.ok) {
     const err = await response.text();
