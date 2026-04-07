@@ -74,10 +74,12 @@ export class TrelloSyncAdapter {
   }
 
   async _getCards(listId) {
+    console.log(`[trello-sync] _getCards: listId=${listId}`);
     return this._trelloFetch(`/lists/${listId}/cards?fields=id,name,desc,idList,labels`);
   }
 
   async _createCard(listId, name, desc = '') {
+    console.log(`[trello-sync] _createCard: listId=${listId}, name=${name}`);
     return this._trelloFetch(`/cards`, {
       method: 'POST',
       body: JSON.stringify({ idList: listId, name, desc }),
