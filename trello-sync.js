@@ -123,13 +123,19 @@ export class TrelloSyncAdapter {
     if (this.disabled || !this.listIds.goals) return [];
 
     const goalsListCards = await this._getCards(this.listIds.goals);
-    const draftListCards = await this._getCards(this.listIds.draft);
+    const doingListCards = this.listIds.doing ? await this._getCards(this.listIds.doing) : [];
+
+    // Scan Goals list for new cards + Doing list for stuck cards (steps:[])
+    const cardsToCheck = [
+      ...goalsListCards,
+      ...doingListCards.filter(c => {
+        try { const m = JSON.parse(c.desc); return m.oodaManaged && Array.isArray(m.steps) && m.steps.length === 0; } catch { return false; }
+      }),
+    ];
 
     const triggeredGoals = [];
 
-    // Check Draft list for cards moved to Goals (simulated: check Draft for unprocessed cards)
-    // For now: check Goals list for cards without OODA metadata that need activation
-    for (const card of goalsListCards) {
+    for (const card of cardsToCheck) {
       let meta = {};
       try {
         meta = card.desc ? JSON.parse(card.desc) : {};
