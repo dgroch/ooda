@@ -473,7 +473,12 @@ class EscalationEngine {
    * Runs BEFORE the LLM's decide — can override it.
    */
   evaluate(context) {
-    if (context.confidence < this.confidenceThreshold) {
+    // Only escalate on low confidence if the step actually requires a skill.
+    // For plain text steps (skillRequired=null), let the kernel attempt execute_text
+    // regardless of confidence — low confidence on a text task just means the LLM
+    // isn't sure it's doing the right thing, but it should still try.
+    const stepNeedsSkill = !!context.actionType && context.actionType !== null && context.actionType !== '';
+    if (context.confidence < this.confidenceThreshold && stepNeedsSkill) {
       return {
         mustEscalate: true,
         reason: `Confidence ${context.confidence.toFixed(2)} below threshold ${this.confidenceThreshold}`,
