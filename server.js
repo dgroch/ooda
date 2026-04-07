@@ -779,6 +779,14 @@ app.get('/circuit-status', auth, (req, res) => {
   res.json(kernel.getCircuitStatus());
 });
 
+// ── POST /circuit-reset ──
+// Full reset of the circuit breaker (clears permanent lockout).
+app.post('/circuit-reset', auth, (req, res) => {
+  kernel.circuitBreaker.fullReset();
+  console.log('[circuit] Full reset triggered via API');
+  res.json({ reset: true, state: kernel.getCircuitStatus() });
+});
+
 // ── POST /halt ──
 // Authenticated kill switch — stops the harness and clears the queue.
 // Uses WEBHOOK_SECRET as bearer token.

@@ -950,15 +950,19 @@ class AgentKernel {
     const result = await this._cycle(activation, trigger);
 
     // Track cross-activation outcomes for runaway-loop prevention.
-    const isFailure = result.status === 'halted'
-      || result.status === 'error'
+    // NOTE: 'halted' from a permanently-open breaker must NOT count as another failure
+    // (that would create a self-reinforcing loop where halted -> failure -> stays halted forever).
+    const isFailure = result.status === 'error'
       || result.reason === 'llm_circuit_open'
       || result.reason === 'max_cycles_exceeded'
       || (result.goalProgress != null && result.goalProgress === 0 && result.status === 'paused');
-    if (isFailure) {
-      this.circuitBreaker.recordActivationFailure(result.reason ?? 'unknown');
-    } else {
-      this.circuitBreaker.recordActivationSuccess();
+    const isBreakerhalt = result.reason === 'activation_failure_limit_exceeded';
+    if (!isBreakerhalt) {
+      if (isFailure) {
+        this.circuitBreaker.recordActivationFailure(result.reason ?? 'unknown');
+      } else {
+        this.circuitBreaker.recordActivationSuccess();
+      }
     }
 
     // Mark non-retryable if breaker just tripped permanently.
