@@ -141,14 +141,15 @@ export class TrelloSyncAdapter {
       if (!meta.oodaManaged) {
         console.log(`[trello-sync] NEW GOAL from Trello: "${card.name}"`);
 
-        // Extract steps from checklist "Steps"
+        // Extract steps from ALL checklists on the card
         const checklists = await this._getChecklists(card.id);
-        const stepsChecklist = checklists.find(c => c.name === 'Steps');
-        const steps = stepsChecklist?.checkItems?.map((item, idx) => ({
+        const allCheckItems = checklists.flatMap(c => c.checkItems ?? []);
+        const steps = allCheckItems.map((item, idx) => ({
           id: `step_${idx + 1}`,
           description: item.name,
-          status: 'pending',
-        })) ?? [];
+          status: item.state === 'complete' ? 'done' : 'pending',
+        }));
+        console.log(`[trello-sync] Found ${checklists.length} checklists, ${steps.length} steps:`, steps.map(s => s.description));
 
         // Trigger OODA via API
         if (this._triggerGoalApi) {
